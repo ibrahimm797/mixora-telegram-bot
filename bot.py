@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -49,6 +50,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def main() -> None:
+    # Python 3.14 no longer creates an implicit event loop; set one explicitly.
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
