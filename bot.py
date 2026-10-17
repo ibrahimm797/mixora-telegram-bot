@@ -2,6 +2,8 @@ import asyncio
 import csv
 import logging
 import os
+import time
+from collections import deque
 
 import requests
 from telegram import Update
@@ -16,7 +18,13 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", "10000"))
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash"
+    ).split(",")
+    if m.strip()
+]
 STORE_URL = "https://cezma.com/store/mixorabuy"
 
 WELCOME = (
@@ -24,6 +32,10 @@ WELCOME = (
     "قولي إنت بتدور على إيه (مثلا: ساعة، سماعة، كاميرا مراقبة) وأنا أرشحلك من منتجاتنا."
 )
 FALLBACK = "وصلتني رسالتك، بس في مشكلة فنية دلوقتي. جرب تاني بعد شوية."
+
+# Short per-chat memory so follow-ups like "تفاصيل" make sense.
+HISTORY: dict[int, deque] = {}
+HISTORY_TURNS = 4
 
 
 def load_catalog() -> str:
@@ -54,7 +66,7 @@ SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora 
 - رد دايما بالعامية المصرية، بشكل ودود ومختصر (٣-٥ سطور بالكتير).
 - رشح منتجات من الكتالوج اللي تحت بس. ممنوع منعا باتا تخترع منتجات أو مواصفات أو أسعار مش موجودة.
 - الأسعار مش موجودة عندك، فقول للعميل إن السعر على صفحة المنتج في المتجر.
-- لما ترشح منتج، اكتب اسمه ولينكه من الكتالوج زي ما هو بالظبط.
+- لما ترشح منتج، اكتب اسمه ولينكه من الكتالوج زي ما هو بالظبط، على سطر لوحده.
 - لو المنتج له لينك أمازون في الكتالوج، ممكن تذكره كاختيار تاني.
 - لو مفيش حاجة في الكتالوج تناسب طلبه، قوله بصراحة ووجهه للمتجر كله: {STORE_URL}
 - لينك المتجر العام: {STORE_URL}
@@ -66,28 +78,75 @@ SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora 
 """
 
 
-def ask_gemini(user_text: str) -> str:
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-        json={
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": user_text}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 600},
-        },
-        timeout=40,
-    )
-    if resp.status_code != 200:
-        logger.warning("Gemini error %s: %s", resp.status_code, resp.text[:300])
-        return FALLBACK
-    data = resp.json()
+def _extract_text(data: dict) -> tuple[str, str]:
     candidates = data.get("candidates") or []
     for cand in candidates:
-        for part in (cand.get("content") or {}).get("parts") or []:
-            text = (part.get("text") or "").strip()
-            if text:
-                return text
-    logger.warning("Gemini empty response: %s", str(data)[:300])
+        finish = cand.get("finishReason") or ""
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join((p.get("text") or "") for p in parts).strip()
+        if text:
+            return text, finish
+    return "", ""
+
+
+def ask_gemini(chat_id: int, user_text: str) -> str:
+    history = HISTORY.setdefault(chat_id, deque(maxlen=HISTORY_TURNS * 2))
+    contents = [
+        {"role": role, "parts": [{"text": text}]} for role, text in history
+    ]
+    contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,
+            # Thinking tokens count against maxOutputTokens and truncate
+            # the visible reply; disable thinking for short sales replies.
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in (1, 2):
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        "x-goog-api-key": GEMINI_API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=40,
+                )
+            except Exception:
+                logger.exception("Gemini request failed (model=%s)", model)
+                break
+            if resp.status_code == 200:
+                text, finish = _extract_text(resp.json())
+                if text:
+                    if finish and finish != "STOP":
+                        logger.warning(
+                            "Gemini finish=%s (model=%s)", finish, model
+                        )
+                    history.append(("user", user_text))
+                    history.append(("model", text))
+                    return text
+                logger.warning("Gemini empty response (model=%s)", model)
+                break
+            logger.warning(
+                "Gemini error %s (model=%s): %s",
+                resp.status_code,
+                model,
+                resp.text[:300],
+            )
+            if resp.status_code in (429, 500, 503) and attempt == 1:
+                time.sleep(2)
+                continue
+            break
+
     return FALLBACK
 
 
@@ -103,7 +162,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(FALLBACK)
         return
     try:
-        reply = await asyncio.to_thread(ask_gemini, text)
+        reply = await asyncio.to_thread(ask_gemini, update.message.chat_id, text)
     except Exception:
         logger.exception("Gemini call failed")
         reply = FALLBACK
