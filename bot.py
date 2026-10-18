@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import io
 import json
@@ -86,8 +87,12 @@ WELCOME = (
 OWNER_WELCOME = (
     "أهلا يا إبراهيم! أنا مساعدك الشخصي هنا. اسألني في أي حاجة: شرح أو ترجمة إنجليزي، "
     "كتابة رسايل وبوستات للمتجر، بحث وتلخيص من الإنترنت، حسابات وتخطيط، أو أسئلة عامة.\n"
-    "- تذكير: قول فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد)\n"
+    "- تذكير: قول فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد) و /reminders لعرضهم\n"
     "- تريندات مصر: ابعت /trends\n"
+    "- ملخص يومك: /briefing (وبيوصلك لوحده كل يوم 9 الصبح)\n"
+    "- مهام وملاحظات وفلوس: /todo و /note و /spent و /earned و /money\n"
+    "- ذاكرة: قول افتكر... أو /remember عشان أفكر تفضيلاتك\n"
+    "- ابعتلي لينك ألخصه، أو فويس نوت أسمعه وأرد عليك\n"
     "- ردود صوتية: ابعت /voice، أو ابدأ رسالتك بكلمة صوت\n"
     "- صورة بنص عربي: ابعت أي صورة منتج واكتب النص في الكابشن\n"
     "- تجربة ردود العملاء: ابعت /store وبعدين سؤالك"
@@ -111,6 +116,7 @@ FONT_URL = (
     "Cairo%5Bslnt%2Cwght%5D.ttf"
 )
 TTS_VOICE = "ar-EG-ShakirNeural"
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botdata.json")
 # Owner chat ids that currently get voice replies too (toggled with /voice).
 VOICE_ON: set = set()
 REMINDERS_DB = os.path.join(
@@ -169,6 +175,48 @@ def ensure_font() -> None:
 
 
 ensure_font()
+
+
+def load_owner_knowledge() -> str:
+    """Private owner knowledge file, delivered as a Render Secret File so it
+    never enters the public repo (root copy) - /etc/secrets path first."""
+    candidates = [
+        "/etc/secrets/owner_knowledge.md",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "owner_knowledge.md"
+        ),
+    ]
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError:
+            continue
+        if text:
+            logger.info("Owner knowledge loaded (%d chars)", len(text))
+            return text
+    logger.info("No owner knowledge file found")
+    return ""
+
+
+OWNER_KNOWLEDGE = load_owner_knowledge()
+
+
+def _load_data() -> dict:
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_data(data: dict) -> None:
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        logger.exception("Could not save bot data")
 
 SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora Buy المصري، وبترد على الناس على تيليجرام وواتساب.
 
@@ -237,6 +285,27 @@ SEARCH_NEEDED: كلمات البحث بالإنجليزي هنا
 - Mixora Buy متجر أفلييت على منصة Cezma: {STORE_URL} - بيسوق منتجات بلينكات شراء (منها أمازون مصر، Amazon Associates Store ID: mixorabuy-21) ومش بيخزن بضاعة.
 - قنواته: فيسبوك وإنستجرام ويوتيوب شورتس وتيليجرام ({CHANNEL_URL}) باسم mixorabuystore، وتيك توك mixorabuy21_store.
 """
+
+if OWNER_KNOWLEDGE:
+    OWNER_SYSTEM_PROMPT += (
+        "\n\nملف المعرفة الخاص بشغل إبراهيم (معلومات محدثة عن المتجر والقنوات "
+        "والقواعد - التزم بيها دايما في إجاباتك وفي أي بوست أو خطة):\n"
+        + OWNER_KNOWLEDGE
+        + "\n"
+    )
+
+
+def owner_prompt() -> str:
+    """Owner system prompt + facts he asked the bot to remember."""
+    mem = _load_data().get("memory", [])
+    if not mem:
+        return OWNER_SYSTEM_PROMPT
+    return (
+        OWNER_SYSTEM_PROMPT
+        + "\n\nحاجات إبراهيم طلب منك تفتكرها عن نفسه وتفضيلاته:\n"
+        + "\n".join(f"- {m}" for m in mem[-50:])
+        + "\n"
+    )
 
 REMINDER_SYSTEM_PROMPT = """إنت نظام بيحول طلبات التذكير لـ JSON. رد بـ JSON بس من غير أي كلمة أو شرح تاني.
 الشكل: {"remind_at": "2026-10-19T17:00", "text": "نص التذكير بالعربي"}
@@ -356,6 +425,76 @@ def fetch_pages_text(urls: list, max_chars: int = 2500) -> str:
     return "\n\n".join(chunks)
 
 
+def _fetch_url(url: str):
+    return requests.get(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        },
+        timeout=15,
+    )
+
+
+def ask_gemini_audio(chat_id, audio_bytes: bytes) -> str:
+    """Transcribe + answer an owner voice note via Gemini inline audio."""
+    body = {
+        "system_instruction": {"parts": [{"text": owner_prompt()}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "audio/ogg",
+                            "data": base64.b64encode(audio_bytes).decode(),
+                        }
+                    },
+                    {
+                        "text": (
+                            "ده فويس نوت من إبراهيم. اسمعه ورد عليه بالعامية المصرية: "
+                            "لو فيه سؤال جاوب عليه، لو طلب نفذه في حدود إمكانياتك، "
+                            "ولو كلام عادي رد بشكل طبيعي. ابدأ ردك بسطر قصير: سمعتك بتقول: ..."
+                        )
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=GEMINI_TIMEOUT * 2,
+            )
+        except Exception:
+            logger.exception("Gemini audio request failed (model=%s)", model)
+            continue
+        if resp.status_code == 200:
+            text, _ = _extract_text(resp.json())
+            if text:
+                return text
+        else:
+            logger.warning(
+                "Gemini audio error %s (model=%s): %s",
+                resp.status_code, model, resp.text[:200],
+            )
+    return FALLBACK
+
+
 # ---- Owner reminders (APScheduler, persisted to sqlite) ----
 
 async def send_reminder(chat_id: int, text: str) -> None:
@@ -445,13 +584,246 @@ async def trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ask_gemini,
             f"trends:{update.message.chat_id}",
             prompt,
-            OWNER_SYSTEM_PROMPT,
+            owner_prompt(),
             2048,
         )
     except Exception:
         logger.exception("Gemini call failed (/trends)")
         reply = FALLBACK
     await update.message.reply_text(reply)
+
+
+# ---- Owner personal-assistant features (todos, notes, money, memory, briefing) ----
+
+def _fmt_entry(e: dict) -> str:
+    return f"{e.get('text', '')} ({e.get('ts', '')[:16]})"
+
+
+async def todo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: /todo -> list, /todo <text> -> add, /todo done N -> complete."""
+    if not _is_owner(update):
+        return
+    data = _load_data()
+    todos = data.setdefault("todos", [])
+    args = context.args or []
+    if args and args[0] == "done" and len(args) > 1 and args[1].isdigit():
+        n = int(args[1]) - 1
+        open_todos = [t for t in todos if not t.get("done")]
+        if 0 <= n < len(open_todos):
+            open_todos[n]["done"] = True
+            _save_data(data)
+            await update.message.reply_text(f"تمام، خلصت: {open_todos[n]['text']}")
+        else:
+            await update.message.reply_text("مفيش مهمة بالرقم ده.")
+        return
+    if not args:
+        open_todos = [t for t in todos if not t.get("done")]
+        if not open_todos:
+            await update.message.reply_text("مفيش مهام مسجلة. ابعت /todo وبعدين المهمة عشان تضيفها.")
+            return
+        lines = [f"{i+1}. {t['text']}" for i, t in enumerate(open_todos)]
+        await update.message.reply_text("مهامك:\n" + "\n".join(lines) + "\n\nلما تخلص واحدة ابعت: /todo done ورقمها")
+        return
+    text = " ".join(args).strip()
+    todos.append({"text": text, "done": False,
+                  "ts": datetime.now(CAIRO).isoformat()})
+    _save_data(data)
+    await update.message.reply_text(f"سجلتها: {text}")
+
+
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: /note -> list notes, /note <text> -> save a note."""
+    if not _is_owner(update):
+        return
+    data = _load_data()
+    notes = data.setdefault("notes", [])
+    args = context.args or []
+    if not args:
+        if not notes:
+            await update.message.reply_text("مفيش ملاحظات. ابعت /note وبعدين الكلام عشان تحفظه.")
+            return
+        lines = [f"- {_fmt_entry(n)}" for n in notes[-15:]]
+        await update.message.reply_text("ملاحظاتك:\n" + "\n".join(lines))
+        return
+    text = " ".join(args).strip()
+    notes.append({"text": text, "ts": datetime.now(CAIRO).isoformat()})
+    _save_data(data)
+    await update.message.reply_text("حفظتها.")
+
+
+def _money_summary(entries: list) -> tuple[float, float]:
+    spent = sum(e.get("amount", 0) for e in entries if e.get("kind") == "spent")
+    earned = sum(e.get("amount", 0) for e in entries if e.get("kind") == "earned")
+    return spent, earned
+
+
+async def money_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: /spent N وصف, /earned N وصف, /money -> summary."""
+    if not _is_owner(update):
+        return
+    data = _load_data()
+    entries = data.setdefault("money", [])
+    cmd = update.message.text.split()[0].lstrip("/").lower()
+    args = context.args or []
+    if cmd == "money":
+        spent, earned = _money_summary(entries)
+        recent = "\n".join(
+            f"- {'صرف' if e['kind']=='spent' else 'دخل'}: {e['amount']:g} جنيه - {e.get('text','')} ({e.get('ts','')[:10]})"
+            for e in entries[-10:]
+        ) or "لسه مفيش حاجة مسجلة."
+        await update.message.reply_text(
+            f"إجمالي الدخل: {earned:g} جنيه\nإجمالي المصروف: {spent:g} جنيه\nالصافي: {earned-spent:g} جنيه\n\nآخر الحركات:\n{recent}"
+        )
+        return
+    if len(args) < 1 or not args[0].replace(".", "", 1).isdigit():
+        await update.message.reply_text(f"اكتبها كده: /{cmd} المبلغ الوصف - مثال: /{cmd} 50 مواصلات")
+        return
+    amount = float(args[0])
+    text = " ".join(args[1:]).strip()
+    entries.append({"kind": cmd, "amount": amount, "text": text,
+                    "ts": datetime.now(CAIRO).isoformat()})
+    _save_data(data)
+    spent, earned = _money_summary(entries)
+    label = "الصرف" if cmd == "spent" else "الدخل"
+    await update.message.reply_text(
+        f"سجلت {label}: {amount:g} جنيه {text}\nالصافي دلوقتي: {earned-spent:g} جنيه"
+    )
+
+
+async def remember_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: /remember <fact> -> bot keeps it in every future reply."""
+    if not _is_owner(update):
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        await update.message.reply_text("اكتب اللي عايزني أفتكره بعد الأمر. مثال: /remember بحب الردود المختصرة")
+        return
+    data = _load_data()
+    mem = data.setdefault("memory", [])
+    mem.append(text)
+    _save_data(data)
+    await update.message.reply_text(f"تمام، هفتكر دايما: {text}")
+
+
+def build_briefing(chat_id: int) -> str:
+    data = _load_data()
+    todos = [t for t in data.get("todos", []) if not t.get("done")]
+    spent, earned = _money_summary(data.get("money", []))
+    today = datetime.now(CAIRO).strftime("%Y-%m-%d")
+    jobs = sorted(SCHEDULER.get_jobs(), key=lambda j: j.next_run_time)
+    todays = [
+        j for j in jobs
+        if j.id and j.id.startswith(f"{chat_id}-")
+        and j.next_run_time.astimezone(CAIRO).strftime("%Y-%m-%d") == today
+    ]
+    lines = [f"صباح الخير يا إبراهيم! ملخص يومك ({today}):"]
+    lines.append(f"- مهام مفتوحة: {len(todos)}")
+    for t in todos[:5]:
+        lines.append(f"  . {t['text']}")
+    if todays:
+        lines.append("- تذكيرات النهاردة:")
+        for j in todays:
+            when = j.next_run_time.astimezone(CAIRO).strftime("%H:%M")
+            note = j.args[1] if len(j.args) > 1 else ""
+            lines.append(f"  . {when} - {note}")
+    else:
+        lines.append("- مفيش تذكيرات النهاردة.")
+    lines.append(f"- الصافي المسجل: {earned-spent:g} جنيه")
+    lines.append("ابعت /trends لو عايز ترندات النهاردة.")
+    return "\n".join(lines)
+
+
+async def briefing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    await update.message.reply_text(build_briefing(update.message.chat_id))
+
+
+async def send_daily_briefing(chat_id: int) -> None:
+    try:
+        await telegram_app.bot.send_message(
+            chat_id=chat_id, text=build_briefing(chat_id)
+        )
+    except Exception:
+        logger.exception("Daily briefing send failed")
+
+
+URL_RE = re.compile(r"https?://\S+")
+LINK_INTENT_RE = re.compile(r"^\s*(لخص|اشرح|ترجم|ايه|ملخص)")
+
+
+async def summarize_link(update: Update, url: str, question: str) -> None:
+    """Owner sent a link: fetch clean text (trafilatura) and summarize."""
+    if not trafilatura:
+        await update.message.reply_text(FALLBACK)
+        return
+    try:
+        resp = await asyncio.to_thread(_fetch_url, url)
+        page_text = trafilatura.extract(resp.text) if resp and resp.status_code == 200 else ""
+    except Exception:
+        page_text = ""
+    if not page_text:
+        await update.message.reply_text("مش قادر أفتح اللينك ده دلوقتي. جرب لينك تاني أو ابعتلي النص نفسه.")
+        return
+    prompt = (
+        f"إبراهيم بعت اللينك ده: {url}\n"
+        + (f"وسؤاله: {question}\n" if question else "")
+        + f"وده محتوى الصفحة:\n{page_text[:12000]}\n\n"
+        "لخصهاله بالعامية المصرية في نقاط واضحة" + ("، وجاوب على سؤاله." if question else ".")
+    )
+    try:
+        reply = await asyncio.to_thread(
+            ask_gemini, update.message.chat_id, prompt, owner_prompt(), 4096
+        )
+    except Exception:
+        reply = FALLBACK
+    await update.message.reply_text(reply)
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner voice notes: transcribe + answer via Gemini audio (no new deps)."""
+    if not _is_owner(update):
+        return
+    if not GEMINI_API_KEY:
+        await update.message.reply_text(FALLBACK)
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=update.message.chat_id, action="typing")
+    except Exception:
+        pass
+    try:
+        media = update.message.voice or update.message.audio
+        file = await context.bot.get_file(media.file_id)
+        data = await file.download_as_bytearray()
+        reply = await asyncio.to_thread(
+            ask_gemini_audio, update.message.chat_id, bytes(data)
+        )
+    except Exception:
+        logger.exception("Voice handling failed")
+        reply = FALLBACK
+    await update.message.reply_text(reply)
+    if update.message.chat_id in VOICE_ON:
+        await send_voice_reply(update.message, reply)
+
+
+async def reminders_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner only: show pending reminders."""
+    if not _is_owner(update):
+        return
+    chat_id = update.message.chat_id
+    jobs = sorted(SCHEDULER.get_jobs(), key=lambda j: j.next_run_time)
+    mine = [j for j in jobs if j.id and j.id.startswith(f"{chat_id}-")]
+    if not mine:
+        await update.message.reply_text(
+            "مفيش تذكيرات مسجلة. قول: فكرني... وحدد المعاد."
+        )
+        return
+    lines = []
+    for j in mine:
+        when = j.next_run_time.astimezone(CAIRO).strftime("%Y-%m-%d الساعة %H:%M")
+        note = j.args[1] if len(j.args) > 1 else ""
+        lines.append(f"- {when}: {note}")
+    await update.message.reply_text("التذكيرات الجاية:\n" + "\n".join(lines))
 
 
 async def voice_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -632,6 +1004,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(FALLBACK)
         return
     is_owner = _is_owner(update)
+    if is_owner and re.match(r"^\s*(افتكر|متنساش)", text):
+        fact = re.sub(r"^\s*(افتكر ان|افتكر إن|افتكر|متنساش ان|متنساش إن|متنساش)\s*", "", text).strip()
+        if fact:
+            data = _load_data()
+            data.setdefault("memory", []).append(fact)
+            _save_data(data)
+            await update.message.reply_text(f"تمام، هفتكر دايما: {fact}")
+            return
     voice_requested = False
     if is_owner and VOICE_PREFIX_RE.match(text):
         voice_requested = True
@@ -645,13 +1025,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             logger.exception("Reminder handling failed")
             await update.message.reply_text(FALLBACK)
         return
+    if is_owner and URL_RE.search(text):
+        url = URL_RE.search(text).group(0)
+        rest = URL_RE.sub("", text).strip()
+        if not rest or LINK_INTENT_RE.match(rest):
+            try:
+                await summarize_link(update, url, rest)
+            except Exception:
+                logger.exception("Link summarize failed")
+                await update.message.reply_text(FALLBACK)
+            return
     try:
         if is_owner:
             reply = await asyncio.to_thread(
                 ask_gemini,
                 update.message.chat_id,
                 text,
-                OWNER_SYSTEM_PROMPT,
+                owner_prompt(),
                 4096,
             )
             if reply.strip().startswith(SEARCH_TOKEN):
@@ -677,7 +1067,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         ask_gemini,
                         update.message.chat_id,
                         follow_up,
-                        OWNER_SYSTEM_PROMPT,
+                        owner_prompt(),
                         4096,
                     )
                 else:
@@ -826,6 +1216,15 @@ async def run() -> None:
     telegram_app.add_handler(CommandHandler("whoami", whoami))
     telegram_app.add_handler(CommandHandler("store", store_ask))
     telegram_app.add_handler(CommandHandler("trends", trends))
+    telegram_app.add_handler(CommandHandler("reminders", reminders_list))
+    telegram_app.add_handler(CommandHandler("todo", todo_cmd))
+    telegram_app.add_handler(CommandHandler("note", note_cmd))
+    telegram_app.add_handler(CommandHandler("spent", money_cmd))
+    telegram_app.add_handler(CommandHandler("earned", money_cmd))
+    telegram_app.add_handler(CommandHandler("money", money_cmd))
+    telegram_app.add_handler(CommandHandler("remember", remember_cmd))
+    telegram_app.add_handler(CommandHandler("briefing", briefing_cmd))
+    telegram_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     telegram_app.add_handler(CommandHandler("voice", voice_toggle))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
@@ -853,6 +1252,19 @@ async def run() -> None:
         # Start the reminder scheduler; saved jobs reload from sqlite and any
         # reminder missed while the service slept fires late (grace window).
         SCHEDULER.start()
+        # Daily 9:00 Cairo briefing for every registered owner.
+        for owner_id in OWNER_IDS:
+            SCHEDULER.add_job(
+                send_daily_briefing,
+                trigger="cron",
+                hour=9,
+                minute=0,
+                args=[owner_id],
+                id=f"briefing-{owner_id}",
+                replace_existing=True,
+                misfire_grace_time=3600,
+                coalesce=True,
+            )
         await asyncio.Event().wait()  # run forever
 
 
