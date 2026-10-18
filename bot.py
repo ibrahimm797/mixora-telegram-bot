@@ -1,13 +1,16 @@
 import asyncio
 import csv
+import json
 import logging
 import os
+import re
 import time
 from collections import deque
 
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from tornado.web import Application as TornadoApp, RequestHandler
 
 logging.basicConfig(level=logging.INFO)
 # Do not log request URLs: they contain the bot token.
@@ -21,11 +24,15 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODELS = [
     m.strip()
     for m in os.environ.get(
-        "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash"
+        "GEMINI_MODELS", "gemini-3.6-flash,gemini-3.5-flash"
     ).split(",")
     if m.strip()
 ]
+# gemini-3.8-flash hangs (no bytes until timeout) as of 2026-10-18; keep it
+# out of the default list. Override anytime with the GEMINI_MODELS env var.
+GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "25"))
 STORE_URL = "https://cezma.com/store/mixorabuy"
+CHANNEL_URL = "https://t.me/mixorabuystore"
 
 WELCOME = (
     "أهلا بيك في Mixora Buy! "
@@ -71,7 +78,14 @@ SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora 
 - لو مفيش حاجة في الكتالوج تناسب طلبه، قوله بصراحة ووجهه للمتجر كله: {STORE_URL}
 - لينك المتجر العام: {STORE_URL}
 - الرد نص عادي من غير Markdown ولا جداول ولا إيموجيز كتير.
-- متردش على أسئلة مش ليها علاقة بالتسوق غير بجملة قصيرة بترجعه للموضوع.
+- متردش على أسئلة مش ليها علاقة بالتسوق أو بالمتجر غير بجملة قصيرة بترجعه للموضوع.
+
+معلومات ثابتة عن المتجر (استخدمها لما حد يسأل عن المتجر نفسه، ومتخرجش عنها):
+- Mixora Buy متجر إلكتروني مصري متعدد الأقسام على منصة Cezma: {STORE_URL}
+- قناة تيليجرام بتاعتنا: {CHANNEL_URL}
+- بنعرض منتجات بلينكات شراء، منها لينكات أمازون مصر، واحنا مش بنخزن بضاعة عندنا.
+- الشراء بيتم من خلال لينك المنتج الموجود في المتجر أو لينك أمازون.
+- أي سؤال عن الشحن أو الدفع أو الاستبدال أو أي تفاصيل مش موجودة هنا: متخترعش إجابة، ووجه العميل لصفحة المتجر {STORE_URL} أو القناة {CHANNEL_URL}.
 
 كتالوج المنتجات:
 {CATALOG}
@@ -119,7 +133,7 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
                         "Content-Type": "application/json",
                     },
                     json=body,
-                    timeout=40,
+                    timeout=GEMINI_TIMEOUT,
                 )
             except Exception:
                 logger.exception("Gemini request failed (model=%s)", model)
@@ -158,6 +172,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     text = (update.message.text or "").strip()
     if not text:
         return
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.message.chat_id, action="typing"
+        )
+    except Exception:
+        pass
     if not GEMINI_API_KEY:
         await update.message.reply_text(FALLBACK)
         return
@@ -169,19 +189,58 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(reply)
 
 
-def main() -> None:
-    # Python 3.14 no longer creates an implicit event loop; set one explicitly.
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    url_path = f"telegram/{TOKEN}"
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=url_path,
-        webhook_url=f"{BASE_URL}/{url_path}" if BASE_URL else None,
+# ---- Web server: health endpoint + Telegram webhook ----
+
+telegram_app = Application.builder().token(TOKEN).updater(None).build()
+
+
+class HealthHandler(RequestHandler):
+    def get(self) -> None:
+        # Plain 200 so free uptime pings (and Render) see the bot as up.
+        self.write("Mixora Buy bot is running")
+
+
+class WebhookHandler(RequestHandler):
+    async def post(self) -> None:
+        try:
+            data = json.loads(self.request.body.decode("utf-8"))
+        except Exception:
+            self.set_status(400)
+            self.finish()
+            return
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.update_queue.put(update)
+        self.set_status(200)
+        self.finish()
+
+
+async def run() -> None:
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    if BASE_URL:
+        await telegram_app.bot.set_webhook(
+            url=f"{BASE_URL}/telegram/{TOKEN}",
+            allowed_updates=Update.ALL_TYPES,
+        )
+        logger.info("Webhook registered")
+
+    tornado_app = TornadoApp(
+        [
+            (r"/", HealthHandler),
+            (rf"/telegram/{re.escape(TOKEN)}", WebhookHandler),
+        ]
     )
+    tornado_app.listen(PORT, address="0.0.0.0")
+
+    async with telegram_app:
+        await telegram_app.start()
+        logger.info("Bot is up on port %s", PORT)
+        await asyncio.Event().wait()  # run forever
+
+
+def main() -> None:
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
