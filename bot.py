@@ -33,15 +33,22 @@ GEMINI_MODELS = [
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "25"))
 STORE_URL = "https://cezma.com/store/mixorabuy"
 CHANNEL_URL = "https://t.me/mixorabuystore"
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
+WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v22.0")
 
 WELCOME = (
     "أهلا بيك في Mixora Buy! "
     "قولي إنت بتدور على إيه (مثلا: ساعة، سماعة، كاميرا مراقبة) وأنا أرشحلك من منتجاتنا."
 )
 FALLBACK = "وصلتني رسالتك، بس في مشكلة فنية دلوقتي. جرب تاني بعد شوية."
+# Gemini returns this exact sentinel when a message is not store-related;
+# the webhook then stays silent (user rule: work messages only).
+IGNORE_TOKEN = "IGNORE_MESSAGE"
 
 # Short per-chat memory so follow-ups like "تفاصيل" make sense.
-HISTORY: dict[int, deque] = {}
+HISTORY: dict = {}
 HISTORY_TURNS = 4
 
 
@@ -67,7 +74,7 @@ def load_catalog() -> str:
 
 CATALOG = load_catalog()
 
-SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora Buy المصري، وبترد على الناس على تيليجرام.
+SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora Buy المصري، وبترد على الناس على تيليجرام وواتساب.
 
 قواعد صارمة:
 - رد دايما بالعامية المصرية، بشكل ودود ومختصر (٣-٥ سطور بالكتير).
@@ -78,7 +85,8 @@ SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora 
 - لو مفيش حاجة في الكتالوج تناسب طلبه، قوله بصراحة ووجهه للمتجر كله: {STORE_URL}
 - لينك المتجر العام: {STORE_URL}
 - الرد نص عادي من غير Markdown ولا جداول ولا إيموجيز كتير.
-- متردش على أسئلة مش ليها علاقة بالتسوق أو بالمتجر غير بجملة قصيرة بترجعه للموضوع.
+- قاعدة صارمة جدا: الرد على رسايل الشغل بس (منتجات المتجر، أقسامه، الطلبات، لينكات الشراء، أسئلة عن Mixora Buy).
+- أي رسالة مش ليها علاقة بالمتجر أو التسوق (كلام شخصي، تحية عامة من غير سؤال عن منتج، أي موضوع تاني): متردش عليها خالص واكتب الكلمة دي بس من غير أي حاجة تانية: IGNORE_MESSAGE
 
 معلومات ثابتة عن المتجر (استخدمها لما حد يسأل عن المتجر نفسه، ومتخرجش عنها):
 - Mixora Buy متجر إلكتروني مصري متعدد الأقسام على منصة Cezma: {STORE_URL}
@@ -189,7 +197,99 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(reply)
 
 
-# ---- Web server: health endpoint + Telegram webhook ----
+
+
+def whatsapp_send(wa_id: str, text: str) -> None:
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_ID}/messages"
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "to": wa_id,
+            "type": "text",
+            "text": {"body": text},
+        },
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        logger.warning("WhatsApp send failed %s: %s", resp.status_code, resp.text[:300])
+
+
+def whatsapp_mark_read(message_id: str) -> None:
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_ID}/messages"
+    try:
+        requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "status": "read",
+                "message_id": message_id,
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def handle_whatsapp_payload(data: dict) -> None:
+    for entry in data.get("entry") or []:
+        for change in entry.get("changes") or []:
+            value = change.get("value") or {}
+            for msg in value.get("messages") or []:
+                if msg.get("type") != "text":
+                    continue
+                wa_id = (msg.get("from") or "").strip()
+                text = ((msg.get("text") or {}).get("body") or "").strip()
+                if not wa_id or not text:
+                    continue
+                try:
+                    whatsapp_mark_read(msg.get("id") or "")
+                except Exception:
+                    pass
+                try:
+                    reply = ask_gemini(f"wa:{wa_id}", text)
+                except Exception:
+                    logger.exception("Gemini call failed (whatsapp)")
+                    reply = FALLBACK
+                if reply.strip() == IGNORE_TOKEN:
+                    logger.info("Ignoring non-work WhatsApp message from %s", wa_id)
+                    continue
+                try:
+                    whatsapp_send(wa_id, reply)
+                except Exception:
+                    logger.exception("WhatsApp send failed")
+
+
+class WhatsAppWebhookHandler(RequestHandler):
+    def get(self) -> None:
+        mode = self.get_query_argument("hub.mode", "")
+        token = self.get_query_argument("hub.verify_token", "")
+        challenge = self.get_query_argument("hub.challenge", "")
+        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN and challenge:
+            self.write(challenge)
+        else:
+            self.set_status(403)
+        self.finish()
+
+    async def post(self) -> None:
+        self.set_status(200)
+        self.finish()
+        try:
+            data = json.loads(self.request.body.decode("utf-8"))
+        except Exception:
+            return
+        # Process in the background; Meta retries on timeouts, so ACK first.
+        asyncio.get_event_loop().run_in_executor(None, handle_whatsapp_payload, data)
+
+# ---- Web server: health endpoint + Telegram + WhatsApp webhooks ----
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
 
@@ -225,12 +325,14 @@ async def run() -> None:
         )
         logger.info("Webhook registered")
 
-    tornado_app = TornadoApp(
-        [
-            (r"/", HealthHandler),
-            (rf"/telegram/{re.escape(TOKEN)}", WebhookHandler),
-        ]
-    )
+    routes = [
+        (r"/", HealthHandler),
+        (rf"/telegram/{re.escape(TOKEN)}", WebhookHandler),
+    ]
+    if WHATSAPP_TOKEN and WHATSAPP_PHONE_ID and WHATSAPP_VERIFY_TOKEN:
+        routes.append((r"/whatsapp/webhook", WhatsAppWebhookHandler))
+        logger.info("WhatsApp webhook enabled at /whatsapp/webhook")
+    tornado_app = TornadoApp(routes)
     tornado_app.listen(PORT, address="0.0.0.0")
 
     async with telegram_app:
@@ -245,3 +347,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
