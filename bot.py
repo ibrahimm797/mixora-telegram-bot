@@ -1,15 +1,42 @@
 import asyncio
 import csv
+import io
 import json
 import logging
 import os
 import re
 import time
+import uuid
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
+
+# Optional owner-mode skills (all free, no API keys). Guarded so a missing
+# package can never take down the store bot.
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
+try:
+    import feedparser
+except ImportError:
+    feedparser = None
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+try:
+    from PIL import Image, ImageDraw, ImageFont, features as pil_features
+except ImportError:
+    Image = ImageDraw = ImageFont = pil_features = None
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+except ImportError:
+    arabic_reshaper = get_display = None
+
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from ddgs import DDGS
@@ -59,8 +86,11 @@ WELCOME = (
 OWNER_WELCOME = (
     "أهلا يا إبراهيم! أنا مساعدك الشخصي هنا. اسألني في أي حاجة: شرح أو ترجمة إنجليزي، "
     "كتابة رسايل وبوستات للمتجر، بحث وتلخيص من الإنترنت، حسابات وتخطيط، أو أسئلة عامة.\n"
-    "لو عايز تذكير قول: فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد)\n"
-    "ولو عايز تشوف البوت بيرد على العملاء إزاي، ابعت /store وبعدين سؤالك."
+    "- تذكير: قول فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد)\n"
+    "- تريندات مصر: ابعت /trends\n"
+    "- ردود صوتية: ابعت /voice، أو ابدأ رسالتك بكلمة صوت\n"
+    "- صورة بنص عربي: ابعت أي صورة منتج واكتب النص في الكابشن\n"
+    "- تجربة ردود العملاء: ابعت /store وبعدين سؤالك"
 )
 FALLBACK = "وصلتني رسالتك، بس في مشكلة فنية دلوقتي. جرب تاني بعد شوية."
 # Gemini returns this exact sentinel when a message is not store-related;
@@ -71,6 +101,12 @@ IGNORE_TOKEN = "IGNORE_MESSAGE"
 # the search and asks again with the results.
 SEARCH_TOKEN = "SEARCH_NEEDED:"
 REMINDER_RE = re.compile(r"^\s*(فكرني|ذكرني|فكرنى|ذكرنى)\b")
+VOICE_PREFIX_RE = re.compile(r"^\s*صوت\s+")
+TRENDS_RSS = "https://trends.google.com/trending/rss?geo=EG"
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Cairo.ttf")
+TTS_VOICE = "ar-EG-ShakirNeural"
+# Owner chat ids that currently get voice replies too (toggled with /voice).
+VOICE_ON: set = set()
 REMINDERS_DB = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "reminders.sqlite"
 )
@@ -257,21 +293,43 @@ def ask_gemini(chat_id, user_text: str, system_prompt: str = None,
     return FALLBACK
 
 
-def web_search(query: str, max_results: int = 5) -> str:
+def web_search(query: str, max_results: int = 5) -> list:
     """Free web search via the ddgs library (DuckDuckGo, no API key).
-    Returns title+snippet lines, or "" on failure."""
+    Returns a list of {title, body, href} dicts, or [] on failure."""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
     except Exception:
         logger.exception("Web search failed")
+        return []
+    return [r for r in results if r.get("title")]
+
+
+def fetch_pages_text(urls: list, max_chars: int = 2500) -> str:
+    """Clean article text from result pages via trafilatura (skill: better summaries)."""
+    if not trafilatura:
         return ""
-    lines = [
-        f"- {(r.get('title') or '').strip()}: {(r.get('body') or '').strip()}"
-        for r in results
-        if r.get("title")
-    ]
-    return "\n".join(lines)
+    chunks = []
+    for url in urls:
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    )
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            text = trafilatura.extract(resp.text)
+            if text:
+                chunks.append(text[:max_chars])
+        except Exception:
+            continue
+    return "\n\n".join(chunks)
 
 
 # ---- Owner reminders (APScheduler, persisted to sqlite) ----
@@ -338,6 +396,163 @@ async def handle_reminder(update: Update, text: str) -> None:
     )
 
 
+async def trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner only: Egypt Google Trends RSS -> Gemini summary with a store angle."""
+    if not _is_owner(update):
+        return
+    if not feedparser or not GEMINI_API_KEY:
+        await update.message.reply_text(FALLBACK)
+        return
+    feed = await asyncio.to_thread(feedparser.parse, TRENDS_RSS)
+    titles = [e.title for e in (feed.entries or [])[:10]]
+    if not titles:
+        await update.message.reply_text(
+            "مش قادر أجيب الترندات دلوقتي. جرب بعد شوية."
+        )
+        return
+    prompt = (
+        "دي أحدث ترندات البحث على جوجل في مصر دلوقتي:\n"
+        + "\n".join(f"- {t}" for t in titles)
+        + "\n\nلخصهم لي في نقاط مختصرة بالعامية المصرية، وفي الآخر قولي: "
+        "أنهي ترند ممكن أستغله في محتوى أو منتج لمتجري Mixora Buy، وليه."
+    )
+    try:
+        reply = await asyncio.to_thread(
+            ask_gemini,
+            f"trends:{update.message.chat_id}",
+            prompt,
+            OWNER_SYSTEM_PROMPT,
+            2048,
+        )
+    except Exception:
+        logger.exception("Gemini call failed (/trends)")
+        reply = FALLBACK
+    await update.message.reply_text(reply)
+
+
+async def voice_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner only: toggle voice replies on/off."""
+    if not _is_owner(update):
+        return
+    chat_id = update.message.chat_id
+    if chat_id in VOICE_ON:
+        VOICE_ON.discard(chat_id)
+        await update.message.reply_text("تمام، الردود الصوتية اتقفلت.")
+    else:
+        VOICE_ON.add(chat_id)
+        await update.message.reply_text(
+            "تمام، هرد عليك صوت وكتابة. ابعت /voice تاني لو عايز تقفلها."
+        )
+
+
+async def send_voice_reply(message, text: str) -> bool:
+    """Generate an Egyptian Arabic voice note with edge-tts and send it."""
+    if not edge_tts:
+        return False
+    path = f"/tmp/tts-{uuid.uuid4().hex}.mp3"
+    try:
+        await edge_tts.Communicate(text[:2000], voice=TTS_VOICE).save(path)
+        with open(path, "rb") as f:
+            await message.reply_voice(voice=f)
+        return True
+    except Exception:
+        logger.exception("TTS failed")
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _shape_arabic(text: str, use_raqm: bool) -> str:
+    """Reshape+bidi for legacy renderers; RAQM does this itself."""
+    if use_raqm:
+        return text
+    if arabic_reshaper and get_display:
+        return get_display(arabic_reshaper.reshape(text))
+    return text
+
+
+def make_caption_image(image_bytes: bytes, caption: str) -> bytes:
+    """Draw an Arabic caption banner on a product photo (Pillow + Cairo font)."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    w, h = img.size
+    font_size = max(28, w // 18)
+    font = ImageFont.truetype(FONT_PATH, font_size)
+    try:
+        font.set_variation_by_axes([700])
+    except Exception:
+        pass
+    use_raqm = bool(pil_features and pil_features.check("raqm"))
+    direction = "rtl" if use_raqm else None
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+
+    def measure(t: str) -> float:
+        return d.textlength(_shape_arabic(t, use_raqm), font=font, direction=direction)
+
+    words = caption.split()
+    lines, cur = [], ""
+    for word in words:
+        trial = (cur + " " + word).strip()
+        if measure(trial) <= w * 0.9:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    if not lines:
+        lines = [caption]
+
+    line_h = int(font_size * 1.5)
+    band_h = line_h * len(lines) + int(font_size * 0.8)
+    d.rectangle([0, h - band_h, w, h], fill=(0, 0, 0, 160))
+    y = h - band_h + int(font_size * 0.4)
+    for line in lines:
+        d.text(
+            (w / 2, y),
+            _shape_arabic(line, use_raqm),
+            font=font,
+            fill="white",
+            anchor="ma",
+            direction=direction,
+        )
+        y += line_h
+    out = Image.alpha_composite(img, overlay).convert("RGB")
+    buf = io.BytesIO()
+    out.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner only: put the caption text on the photo as an Arabic banner."""
+    if not _is_owner(update):
+        return  # customers keep the old behavior: photos ignored
+    caption = (update.message.caption or "").strip()
+    if not caption:
+        await update.message.reply_text(
+            "ابعت الصورة تاني واكتب النص اللي عايزه عليها في الكابشن."
+        )
+        return
+    if not (Image and os.path.exists(FONT_PATH)):
+        await update.message.reply_text(FALLBACK)
+        return
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        data = await file.download_as_bytearray()
+        result = await asyncio.to_thread(
+            make_caption_image, bytes(data), caption[:200]
+        )
+        await update.message.reply_photo(photo=io.BytesIO(result))
+    except Exception:
+        logger.exception("Caption image failed")
+        await update.message.reply_text(FALLBACK)
+
+
 def _is_owner(update: Update) -> bool:
     user = update.effective_user
     return bool(user) and user.id in OWNER_IDS
@@ -393,6 +608,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(FALLBACK)
         return
     is_owner = _is_owner(update)
+    voice_requested = False
+    if is_owner and VOICE_PREFIX_RE.match(text):
+        voice_requested = True
+        text = VOICE_PREFIX_RE.sub("", text, count=1).strip()
+        if not text:
+            return
     if is_owner and REMINDER_RE.match(text):
         try:
             await handle_reminder(update, text)
@@ -413,11 +634,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 query = reply.strip()[len(SEARCH_TOKEN):].strip() or text
                 results = await asyncio.to_thread(web_search, query)
                 if results:
+                    lines = "\n".join(
+                        f"- {(r.get('title') or '').strip()}: {(r.get('body') or '').strip()}"
+                        for r in results
+                    )
+                    pages = await asyncio.to_thread(
+                        fetch_pages_text,
+                        [(r.get("href") or "") for r in results[:2]],
+                    )
                     follow_up = (
                         f"دورت على الإنترنت عن: {query}\n"
-                        f"ودي نتايج البحث:\n{results}\n\n"
-                        f"لخصها وجاوب على سؤالي الأصلي: {text}"
+                        f"ودي نتايج البحث:\n{lines}\n\n"
                     )
+                    if pages:
+                        follow_up += f"وده نص صفحات من النتايج:\n{pages}\n\n"
+                    follow_up += f"لخصها وجاوب على سؤالي الأصلي: {text}"
                     reply = await asyncio.to_thread(
                         ask_gemini,
                         update.message.chat_id,
@@ -445,6 +676,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             logger.info("Ignoring non-work Telegram message")
             return
     await update.message.reply_text(reply)
+    if is_owner and (voice_requested or update.message.chat_id in VOICE_ON):
+        await send_voice_reply(update.message, reply)
 
 
 
@@ -568,7 +801,10 @@ async def run() -> None:
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("whoami", whoami))
     telegram_app.add_handler(CommandHandler("store", store_ask))
+    telegram_app.add_handler(CommandHandler("trends", trends))
+    telegram_app.add_handler(CommandHandler("voice", voice_toggle))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
     if BASE_URL:
         await telegram_app.bot.set_webhook(
