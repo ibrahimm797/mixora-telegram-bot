@@ -104,6 +104,12 @@ REMINDER_RE = re.compile(r"^\s*(فكرني|ذكرني|فكرنى|ذكرنى)\b")
 VOICE_PREFIX_RE = re.compile(r"^\s*صوت\s+")
 TRENDS_RSS = "https://trends.google.com/trending/rss?geo=EG"
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Cairo.ttf")
+# Cairo (OFL, Google Fonts) is downloaded once at startup instead of being
+# committed to the repo; the disk is ephemeral, so it re-downloads per deploy.
+FONT_URL = (
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/cairo/"
+    "Cairo%5Bslnt%2Cwght%5D.ttf"
+)
 TTS_VOICE = "ar-EG-ShakirNeural"
 # Owner chat ids that currently get voice replies too (toggled with /voice).
 VOICE_ON: set = set()
@@ -145,6 +151,24 @@ def load_catalog() -> str:
 
 
 CATALOG = load_catalog()
+
+
+def ensure_font() -> None:
+    if os.path.exists(FONT_PATH):
+        return
+    try:
+        resp = requests.get(FONT_URL, timeout=30)
+        if resp.status_code == 200 and len(resp.content) > 10000:
+            with open(FONT_PATH, "wb") as f:
+                f.write(resp.content)
+            logger.info("Cairo font downloaded (%d bytes)", len(resp.content))
+        else:
+            logger.warning("Font download failed: HTTP %s", resp.status_code)
+    except Exception:
+        logger.exception("Font download failed")
+
+
+ensure_font()
 
 SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora Buy المصري، وبترد على الناس على تيليجرام وواتساب.
 
