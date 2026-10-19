@@ -725,6 +725,63 @@ def ask_gemini_audio(chat_id, audio_bytes: bytes) -> str:
     return FALLBACK
 
 
+def transcribe_voice(audio_bytes: bytes) -> str:
+    """Literal Arabic transcript of an owner voice note; '' on silence/failure."""
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "audio/ogg",
+                            "data": base64.b64encode(audio_bytes).decode(),
+                        }
+                    },
+                    {
+                        "text": (
+                            "انسخ الكلام اللي في التسجيل ده حرفيا بالعربي، من غير أي "
+                            "تعليق أو شرح أو ترجمة. لو مفيش كلام واضح اكتب: EMPTY"
+                        )
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 512,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=GEMINI_TIMEOUT * 2,
+            )
+        except Exception:
+            logger.exception("Voice transcription failed (model=%s)", model)
+            continue
+        if resp.status_code == 200:
+            text, _ = _extract_text(resp.json())
+            if text:
+                t = text.strip()
+                if t and not t.startswith("EMPTY"):
+                    return t
+                return ""
+        else:
+            logger.warning(
+                "Transcription error %s (model=%s)", resp.status_code, model
+            )
+    return ""
+
+
 # ---- Owner reminders (APScheduler, persisted to sqlite) ----
 
 async def send_reminder(chat_id: int, text: str) -> None:
@@ -1038,6 +1095,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         media = update.message.voice or update.message.audio
         file = await context.bot.get_file(media.file_id)
         data = await file.download_as_bytearray()
+        transcript = await asyncio.to_thread(transcribe_voice, bytes(data))
+        if transcript:
+            handled = await handle_arabic_intent(update, transcript)
+            if handled:
+                return
         reply = await asyncio.to_thread(
             ask_gemini_audio, update.message.chat_id, bytes(data)
         )
@@ -1235,6 +1297,172 @@ async def store_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
+# ---- Egyptian-Arabic natural-language intents (owner; no slash needed) ----
+
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+AR_TRENDS_RE = re.compile(
+    r"^(/ترند|ترند|ترندات|الترند|الترندات|trends?|ترند ايه|ايه الترند|إيه الترند|"
+    r"ترندات مصر|الترند النهاردة|الترند النهارده)\s*$", re.I)
+AR_BRIEFING_RE = re.compile(
+    r"^(/ملخص|/بريفينج|الملخص|ملخصي|ملخص النهاردة|ملخص النهارده|"
+    r"ايه عندي النهاردة|إيه عندي النهاردة|إيه عندي النهارده|عندي ايه النهاردة|"
+    r"جدولي|الاجندة|أجندة اليوم)\s*$")
+AR_REMINDERS_RE = re.compile(
+    r"^(/تذكيرات|تذكيراتي|ايه تذكيراتي|إيه تذكيراتي|التذكيرات)\s*$")
+AR_TODO_LIST_RE = re.compile(
+    r"^(/مهام|/تودو|مهامي|المهام|قولي مهامي|ايه مهامي|إيه مهامي|"
+    r"عندي مهام ايه|عندي ايه مهام|التودو)\s*$")
+AR_TODO_ADD_RE = re.compile(
+    r"^(ضيف|اضيف|أضيف|سجل|حط|زود|اكتب)(لي)?\s+(مهمة|مهمّة)\s*[:،]?\s*(.+)$")
+AR_TODO_DONE_RE = re.compile(
+    r"^(خلصت|شيل|امسح)\s+(المهمة\s+)?(رقم\s+)?(\d+)\s*$")
+AR_TODO_DONE_TEXT_RE = re.compile(r"^خلصت\s+(.+)$")
+AR_NOTE_LIST_RE = re.compile(
+    r"^(/ملاحظة|/ملاحظات|/نوت|ملاحظاتي|قولي ملاحظاتي|ايه ملاحظاتي|إيه ملاحظاتي)\s*$")
+AR_NOTE_ADD_RE = re.compile(
+    r"^(?:/ملاحظة\s+|(?:سجل|اكتب|حط)(لي)?\s+(?:ملاحظة|نوت)\s*[:،]?\s*"
+    r"|ملاحظة\s*[:،]\s*)(.+)$")
+AR_MONEY_SUMMARY_RE = re.compile(
+    r"^(/فلوس|/حساب|فلوسي|حسابي|مصاريفي|ايه حسابي|إيه حسابي|صرفت كام|"
+    r"كام صرفت|الميزانية)\s*$")
+AR_SPENT_RE = re.compile(
+    r"^(?:/مصروف\s+|سجل\s+مصروف\s+|صرفت\s+|دفعت\s+)"
+    r"(\d+(?:\.\d+)?)\s*(?:جنيه|ج|جنية)?\s*(.*)$")
+AR_EARN_RE = re.compile(
+    r"^(?:/دخل\s+|سجل\s+دخل\s+|كسبت\s+|قبضت\s+|جالي\s+)"
+    r"(\d+(?:\.\d+)?)\s*(?:جنيه|ج|جنية)?\s*(.*)$")
+
+
+async def handle_arabic_intent(update: Update, text: str) -> bool:
+    """Run owner commands phrased in plain Egyptian Arabic. True if handled."""
+    t = text.strip().translate(_AR_DIGITS)
+    if not t:
+        return False
+    data = _load_data()
+    m = re.match(r"^(افتكر|متنساش)\s*(اني|إني|ان|إن)?\s*(.+)$", t)
+    if m and m.group(3).strip():
+        fact = m.group(3).strip()
+        data.setdefault("memory", []).append(fact)
+        _save_data(data)
+        await update.message.reply_text(f"تمام، هفتكر دايما: {fact}")
+        return True
+    if AR_TRENDS_RE.match(t):
+        await trends(update, None)
+        return True
+    if AR_BRIEFING_RE.match(t):
+        await update.message.reply_text(build_briefing(update.message.chat_id))
+        return True
+    if AR_REMINDERS_RE.match(t):
+        await reminders_list(update, None)
+        return True
+    if REMINDER_RE.match(t):
+        try:
+            await handle_reminder(update, t)
+        except Exception:
+            logger.exception("Reminder handling failed")
+            await update.message.reply_text(FALLBACK)
+        return True
+    if AR_TODO_LIST_RE.match(t):
+        open_todos = [x for x in data.get("todos", []) if not x.get("done")]
+        if not open_todos:
+            await update.message.reply_text("مفيش مهام مسجلة. قول: ضيف مهمة وبعدين المهمة.")
+        else:
+            lines = [f"{i+1}. {x['text']}" for i, x in enumerate(open_todos)]
+            await update.message.reply_text(
+                "مهامك:\n" + "\n".join(lines) + "\n\nلما تخلص واحدة قول: خلصت ورقمها"
+            )
+        return True
+    m = AR_TODO_ADD_RE.match(t)
+    if m:
+        task = m.group(4).strip()
+        data.setdefault("todos", []).append(
+            {"text": task, "done": False, "ts": datetime.now(CAIRO).isoformat()}
+        )
+        _save_data(data)
+        await update.message.reply_text(f"سجلتها: {task}")
+        return True
+    m = AR_TODO_DONE_RE.match(t)
+    if m:
+        n = int(m.group(4)) - 1
+        open_todos = [x for x in data.get("todos", []) if not x.get("done")]
+        if 0 <= n < len(open_todos):
+            open_todos[n]["done"] = True
+            _save_data(data)
+            await update.message.reply_text(f"تمام، خلصت: {open_todos[n]['text']}")
+        else:
+            await update.message.reply_text("مفيش مهمة بالرقم ده. ابعت: مهامي")
+        return True
+    m = AR_TODO_DONE_TEXT_RE.match(t)
+    if m:
+        frag = m.group(1).strip()
+        for x in data.get("todos", []):
+            if not x.get("done") and frag and frag in x.get("text", ""):
+                x["done"] = True
+                _save_data(data)
+                await update.message.reply_text(f"تمام، خلصت: {x['text']}")
+                return True
+        await update.message.reply_text("مش لاقي مهمة مفتوحة فيها الكلام ده. ابعت: مهامي")
+        return True
+    if AR_NOTE_LIST_RE.match(t):
+        notes = data.get("notes", [])
+        if not notes:
+            await update.message.reply_text("مفيش ملاحظات. قول: سجل ملاحظة وبعدين الكلام.")
+        else:
+            lines = [f"- {_fmt_entry(n)}" for n in notes[-15:]]
+            await update.message.reply_text("ملاحظاتك:\n" + "\n".join(lines))
+        return True
+    m = AR_NOTE_ADD_RE.match(t)
+    if m:
+        note = m.group(2).strip()
+        data.setdefault("notes", []).append(
+            {"text": note, "ts": datetime.now(CAIRO).isoformat()}
+        )
+        _save_data(data)
+        await update.message.reply_text("حفظتها.")
+        return True
+    if AR_MONEY_SUMMARY_RE.match(t):
+        entries = data.get("money", [])
+        spent, earned = _money_summary(entries)
+        recent = "\n".join(
+            f"- {'صرف' if e['kind']=='spent' else 'دخل'}: {e['amount']:g} جنيه - {e.get('text','')} ({e.get('ts','')[:10]})"
+            for e in entries[-10:]
+        ) or "لسه مفيش حاجة مسجلة."
+        await update.message.reply_text(
+            f"إجمالي الدخل: {earned:g} جنيه\nإجمالي المصروف: {spent:g} جنيه\n"
+            f"الصافي: {earned-spent:g} جنيه\n\nآخر الحركات:\n{recent}"
+        )
+        return True
+    m = AR_SPENT_RE.match(t)
+    if m:
+        amount = float(m.group(1))
+        desc = re.sub(r"^(على|في|لـ|ل)\s+", "", (m.group(2) or "").strip())
+        data.setdefault("money", []).append(
+            {"kind": "spent", "amount": amount, "text": desc,
+             "ts": datetime.now(CAIRO).isoformat()}
+        )
+        _save_data(data)
+        spent, earned = _money_summary(data["money"])
+        await update.message.reply_text(
+            f"سجلت الصرف: {amount:g} جنيه {desc}\nالصافي دلوقتي: {earned-spent:g} جنيه"
+        )
+        return True
+    m = AR_EARN_RE.match(t)
+    if m:
+        amount = float(m.group(1))
+        desc = re.sub(r"^(على|في|من|لـ|ل)\s+", "", (m.group(2) or "").strip())
+        data.setdefault("money", []).append(
+            {"kind": "earned", "amount": amount, "text": desc,
+             "ts": datetime.now(CAIRO).isoformat()}
+        )
+        _save_data(data)
+        spent, earned = _money_summary(data["money"])
+        await update.message.reply_text(
+            f"سجلت الدخل: {amount:g} جنيه {desc}\nالصافي دلوقتي: {earned-spent:g} جنيه"
+        )
+        return True
+    return False
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return  # channel service posts (pins etc.) carry no message
@@ -1258,6 +1486,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             data.setdefault("memory", []).append(fact)
             _save_data(data)
             await update.message.reply_text(f"تمام، هفتكر دايما: {fact}")
+            return
+    if is_owner:
+        try:
+            if await handle_arabic_intent(update, text):
+                return
+        except Exception:
+            logger.exception("Arabic intent handling failed")
+            await update.message.reply_text(FALLBACK)
             return
     voice_requested = False
     if is_owner and VOICE_PREFIX_RE.match(text):
