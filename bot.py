@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import zlib
 import time
 import uuid
 from collections import deque
@@ -42,7 +43,11 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from ddgs import DDGS
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InputFile
+from telegram.ext import (
+    Application, ChatMemberHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
+)
 from tornado.web import Application as TornadoApp, RequestHandler
 
 logging.basicConfig(level=logging.INFO)
@@ -215,8 +220,220 @@ def _save_data(data: dict) -> None:
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
+        queue_backup()
     except Exception:
         logger.exception("Could not save bot data")
+
+
+# ---- Durable backup of owner data to a private Telegram channel ----
+# Render's free disk is ephemeral: every redeploy wipes botdata.json and the
+# reminders sqlite. The bot keeps its state in a private Telegram channel
+# (owner + bot only): one pinned pointer message holds the whole state
+# compressed inline ("BK0:<base64(zlib(json))>"), or points to a document
+# message ("BK1:<file_id>") when the state grows past the text limit.
+BACKUP_CHANNEL_ID = os.environ.get("BACKUP_CHANNEL_ID", "").strip()
+_BACKUP_TASK = None
+BACKUP_INLINE_LIMIT = 3900  # Telegram text limit is 4096 chars
+
+
+def _backup_chat_id():
+    if BACKUP_CHANNEL_ID:
+        try:
+            return int(BACKUP_CHANNEL_ID)
+        except ValueError:
+            logger.warning("BACKUP_CHANNEL_ID is not a number: %r", BACKUP_CHANNEL_ID)
+    return _load_data().get("backup_channel_id")
+
+
+def build_state_bundle() -> dict:
+    data = _load_data()
+    chat_id = _backup_chat_id()
+    if chat_id:
+        data["backup_channel_id"] = chat_id
+    return {
+        "v": 1,
+        "saved_at": datetime.now(CAIRO).isoformat(),
+        "data": data,
+        "reminders": data.get("reminders", []),
+    }
+
+
+def _pack_bundle(bundle: dict) -> tuple[str, bytes]:
+    raw = json.dumps(bundle, ensure_ascii=False).encode("utf-8")
+    payload = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii")
+    if len(payload) <= BACKUP_INLINE_LIMIT:
+        return "BK0:" + payload, raw
+    return None, raw  # too big: caller sends the raw JSON as a document
+
+
+def _unpack_inline(payload: str) -> dict:
+    raw = zlib.decompress(base64.urlsafe_b64decode(payload.encode("ascii")))
+    return json.loads(raw.decode("utf-8"))
+
+
+def apply_state_bundle(bundle: dict) -> tuple[int, int, int]:
+    data = bundle.get("data") or {}
+    rems = bundle.get("reminders") or data.get("reminders") or []
+    now_ts = time.time()
+    future = []
+    for r in rems:
+        try:
+            when = datetime.fromisoformat(r["iso"])
+        except Exception:
+            continue
+        if when.timestamp() > now_ts:
+            future.append(r)
+            schedule_reminder(int(r["chat_id"]), when, r["text"])
+    data["reminders"] = future
+    _save_data(data)
+    return (
+        len([t for t in data.get("todos", []) if not t.get("done")]),
+        len(data.get("notes", [])),
+        len(future),
+    )
+
+
+async def backup_now() -> None:
+    chat_id = _backup_chat_id()
+    if not chat_id:
+        logger.info("Backup skipped: no backup channel linked yet")
+        return
+    try:
+        bundle = build_state_bundle()
+        text, raw = _pack_bundle(bundle)
+        if text is None:
+            sent = await telegram_app.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(io.BytesIO(raw), filename="mixora_backup.json"),
+                caption="نسخة احتياطية",
+            )
+            text = "BK1:" + sent.document.file_id
+        chat = await telegram_app.bot.get_chat(chat_id)
+        pinned = chat.pinned_message
+        if pinned and pinned.text and pinned.text.startswith("BK"):
+            await telegram_app.bot.edit_message_text(
+                chat_id=chat_id, message_id=pinned.message_id, text=text
+            )
+        else:
+            msg = await telegram_app.bot.send_message(chat_id=chat_id, text=text)
+            await telegram_app.bot.pin_chat_message(
+                chat_id=chat_id, message_id=msg.message_id, disable_notification=True
+            )
+        d = bundle["data"]
+        logger.info(
+            "Backup written to Telegram channel (todos=%d notes=%d reminders=%d)",
+            len(d.get("todos", [])), len(d.get("notes", [])),
+            len(d.get("reminders", [])),
+        )
+    except Exception:
+        logger.exception("Backup to Telegram channel failed")
+
+
+async def restore_from_backup() -> bool:
+    chat_id = _backup_chat_id()
+    if not chat_id:
+        logger.info("Restore skipped: no backup channel linked yet")
+        return False
+    try:
+        chat = await telegram_app.bot.get_chat(chat_id)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.text or not pinned.text.startswith("BK"):
+            logger.info("No backup found in channel (fresh start)")
+            return False
+        if pinned.text.startswith("BK0:"):
+            bundle = _unpack_inline(pinned.text[4:])
+        else:
+            f = await telegram_app.bot.get_file(pinned.text[4:].strip())
+            raw = bytes(await f.download_as_bytearray())
+            bundle = json.loads(raw.decode("utf-8"))
+        todos_n, notes_n, rems_n = apply_state_bundle(bundle)
+        logger.info(
+            "State restored from Telegram backup (todos=%d notes=%d reminders=%d saved_at=%s)",
+            todos_n, notes_n, rems_n, bundle.get("saved_at", "?"),
+        )
+        return True
+    except Exception:
+        logger.exception("Restore from Telegram backup failed")
+        return False
+
+
+async def _debounced_backup() -> None:
+    await asyncio.sleep(10)
+    await backup_now()
+
+
+def queue_backup() -> None:
+    """Debounced: fold bursts of edits into one channel write."""
+    global _BACKUP_TASK
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _BACKUP_TASK and not _BACKUP_TASK.done():
+        _BACKUP_TASK.cancel()
+    _BACKUP_TASK = asyncio.create_task(_debounced_backup())
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner adds the bot as admin to the private backup channel -> link it."""
+    cm = update.my_chat_member
+    if not cm or cm.chat.type != "channel":
+        return
+    if cm.new_chat_member.status not in ("administrator", "member"):
+        return
+    data = _load_data()
+    if data.get("backup_channel_id") == cm.chat.id:
+        return
+    data["backup_channel_id"] = cm.chat.id
+    _save_data(data)
+    logger.info("Backup channel detected: %s (%s)", cm.chat.id, cm.chat.title)
+    for oid in OWNER_IDS:
+        try:
+            await telegram_app.bot.send_message(
+                oid,
+                "تمام، ربطت قناة النسخ الاحتياطي. من دلوقتي بياناتك "
+                "(مهام، ملاحظات، فلوس، ذكريات، تذكيرات) محفوظة حتى لو البوت اتعاد تشغيله.\n"
+                "ابعت السطر ده لإنستنكت عشان يثبته نهائيا:\n"
+                f"BACKUP_ID {cm.chat.id}",
+            )
+        except Exception:
+            logger.exception("Could not message owner about backup channel")
+
+
+async def backupstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: /backupstatus -> what is saved in the backup channel."""
+    if not _is_owner(update):
+        return
+    chat_id = _backup_chat_id()
+    if not chat_id:
+        await update.message.reply_text(
+            "النسخ الاحتياطي لسه مش مظبوط. اعمل قناة تيليجرام خاصة جديدة "
+            "وضيفني فيها أدمن، وأنا هربطها لوحدي."
+        )
+        return
+    try:
+        chat = await telegram_app.bot.get_chat(chat_id)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.text or not pinned.text.startswith("BK"):
+            await update.message.reply_text("القناة مربوطة بس لسه مفيش نسخة محفوظة.")
+            return
+        if pinned.text.startswith("BK0:"):
+            bundle = _unpack_inline(pinned.text[4:])
+            d = bundle.get("data", {})
+            open_todos = len([t for t in d.get("todos", []) if not t.get("done")])
+            await update.message.reply_text(
+                "آخر نسخة محفوظة: "
+                + str(bundle.get("saved_at", "?"))[:16]
+                + f"\nمهام مفتوحة: {open_todos} | ملاحظات: {len(d.get('notes', []))}"
+                + f" | حركات فلوس: {len(d.get('money', []))}"
+                + f" | ذكريات: {len(d.get('memory', []))}"
+                + f" | تذكيرات جاية: {len(d.get('reminders', []))}"
+            )
+        else:
+            await update.message.reply_text("النسخة محفوظة كملف في القناة (بيانات كبيرة).")
+    except Exception:
+        logger.exception("backupstatus failed")
+        await update.message.reply_text(FALLBACK)
 
 SYSTEM_PROMPT = f"""إنت مساعد المبيعات بتاع متجر Mixora Buy المصري، وبترد على الناس على تيليجرام وواتساب.
 
@@ -504,6 +721,12 @@ async def send_reminder(chat_id: int, text: str) -> None:
         )
     except Exception:
         logger.exception("Reminder send failed")
+    data = _load_data()
+    rems = [r for r in data.get("reminders", [])
+            if not (int(r.get("chat_id", 0)) == chat_id and r.get("text") == text)]
+    if len(rems) != len(data.get("reminders", [])):
+        data["reminders"] = rems
+        _save_data(data)
 
 
 def schedule_reminder(chat_id: int, remind_at: datetime, text: str) -> None:
@@ -553,6 +776,11 @@ async def handle_reminder(update: Update, text: str) -> None:
         await update.message.reply_text("المعاد ده عدى خلاص! قوللي معاد تاني.")
         return
     schedule_reminder(update.message.chat_id, when, note)
+    data = _load_data()
+    data.setdefault("reminders", []).append(
+        {"chat_id": update.message.chat_id, "text": note, "iso": when.isoformat()}
+    )
+    _save_data(data)
     label = when.strftime("%Y-%m-%d الساعة %H:%M")
     await update.message.reply_text(
         f"تمام، هفكرك يوم {label} بتوقيت القاهرة: {note}"
@@ -1228,6 +1456,8 @@ async def run() -> None:
     telegram_app.add_handler(CommandHandler("voice", voice_toggle))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    telegram_app.add_handler(CommandHandler("backupstatus", backupstatus_cmd))
+    telegram_app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     if BASE_URL:
         await telegram_app.bot.set_webhook(
@@ -1252,6 +1482,9 @@ async def run() -> None:
         # Start the reminder scheduler; saved jobs reload from sqlite and any
         # reminder missed while the service slept fires late (grace window).
         SCHEDULER.start()
+        # Restore owner state (todos, notes, money, memory, reminders) from
+        # the private Telegram backup channel if one is linked.
+        await restore_from_backup()
         # Daily 9:00 Cairo briefing for every registered owner.
         for owner_id in OWNER_IDS:
             SCHEDULER.add_job(
