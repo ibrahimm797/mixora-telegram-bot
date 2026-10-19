@@ -110,6 +110,19 @@ IGNORE_TOKEN = "IGNORE_MESSAGE"
 # query when the question needs fresh info from the web; the bot then runs
 # the search and asks again with the results.
 SEARCH_TOKEN = "SEARCH_NEEDED:"
+# Gemini does not always match the exact casing ("SEARCH_needed:" leaked to
+# the user once), so detect the marker case-insensitively and never let it
+# reach a chat.
+SEARCH_TOKEN_RE = re.compile(r"^\s*SEARCH[_ ]NEEDED\s*:?\s*", re.I)
+
+
+def _strip_search_marker(reply: str):
+    """Return the search query if the reply is a search request, else None."""
+    m = SEARCH_TOKEN_RE.match(reply or "")
+    if m:
+        return (reply or "")[m.end():].strip()
+    return None
+
 REMINDER_RE = re.compile(r"^\s*(فكرني|ذكرني|فكرنى|ذكرنى)\b")
 VOICE_PREFIX_RE = re.compile(r"^\s*صوت\s+")
 TRENDS_RSS = "https://trends.google.com/trending/rss?geo=EG"
@@ -1246,6 +1259,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text = VOICE_PREFIX_RE.sub("", text, count=1).strip()
         if not text:
             return
+    if is_owner and re.match(r"^\s*(ترند|ترندات|الترند|الترندات|trends?)\s*$", text, re.I):
+        await trends(update, context)
+        return
     if is_owner and REMINDER_RE.match(text):
         try:
             await handle_reminder(update, text)
@@ -1272,8 +1288,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 owner_prompt(),
                 4096,
             )
-            if reply.strip().startswith(SEARCH_TOKEN):
-                query = reply.strip()[len(SEARCH_TOKEN):].strip() or text
+            query = _strip_search_marker(reply)
+            if query is not None:
+                query = query or text
                 results = await asyncio.to_thread(web_search, query)
                 if results:
                     lines = "\n".join(
@@ -1298,6 +1315,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         owner_prompt(),
                         4096,
                     )
+                    leftover = _strip_search_marker(reply)
+                    if leftover is not None:
+                        reply = leftover if len(leftover) > 20 else FALLBACK
                 else:
                     reply = (
                         "حاولت أدور على الإنترنت بس البحث مش شغال دلوقتي. "
@@ -1444,6 +1464,7 @@ async def run() -> None:
     telegram_app.add_handler(CommandHandler("whoami", whoami))
     telegram_app.add_handler(CommandHandler("store", store_ask))
     telegram_app.add_handler(CommandHandler("trends", trends))
+    telegram_app.add_handler(CommandHandler("trend", trends))
     telegram_app.add_handler(CommandHandler("reminders", reminders_list))
     telegram_app.add_handler(CommandHandler("todo", todo_cmd))
     telegram_app.add_handler(CommandHandler("note", note_cmd))
