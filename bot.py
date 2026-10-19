@@ -1022,6 +1022,8 @@ async def summarize_link(update: Update, url: str, question: str) -> None:
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     """Owner voice notes: transcribe + answer via Gemini audio (no new deps)."""
     if not _is_owner(update):
         return
@@ -1165,6 +1167,8 @@ def make_caption_image(image_bytes: bytes, caption: str) -> bytes:
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     """Owner only: put the caption text on the photo as an Arabic banner."""
     if not _is_owner(update):
         return  # customers keep the old behavior: photos ignored
@@ -1232,6 +1236,8 @@ async def store_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return  # channel service posts (pins etc.) carry no message
     text = (update.message.text or "").strip()
     if not text:
         return
