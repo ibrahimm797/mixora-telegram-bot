@@ -14,7 +14,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
-from urllib.parse import quote_plus
 
 # Optional owner-mode skills (all free, no API keys). Guarded so a missing
 # package can never take down the store bot.
@@ -95,7 +94,6 @@ OWNER_WELCOME = (
     "كتابة رسايل وبوستات للمتجر، بحث وتلخيص من الإنترنت، حسابات وتخطيط، أو أسئلة عامة.\n"
     "- تذكير: قول فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد) و /reminders لعرضهم\n"
     "- تريندات مصر: ابعت /trends\n"
-    "- أخبار أي موضوع: /news وبعدها الكلمة (مثال: /news سماعات بلوتوث)\n"
     "- ملخص يومك: /briefing (وبيوصلك لوحده كل يوم 9 الصبح)\n"
     "- مهام وملاحظات وفلوس: /todo و /note و /spent و /earned و /money\n"
     "- ذاكرة: قول افتكر... أو /remember عشان أفكر تفضيلاتك\n"
@@ -128,7 +126,6 @@ def _strip_search_marker(reply: str):
 REMINDER_RE = re.compile(r"^\s*(فكرني|ذكرني|فكرنى|ذكرنى)\b")
 VOICE_PREFIX_RE = re.compile(r"^\s*صوت\s+")
 TRENDS_RSS = "https://trends.google.com/trending/rss?geo=EG"
-NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=ar&gl=EG&ceid=EG:ar"
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Cairo.ttf")
 # Cairo (OFL, Google Fonts) is downloaded once at startup instead of being
 # committed to the repo; the disk is ephemeral, so it re-downloads per deploy.
@@ -894,50 +891,6 @@ async def trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
-async def _news_reply(update: Update, query: str) -> None:
-    """Shared body for /news and the Arabic news intent."""
-    url = NEWS_RSS.format(query=quote_plus(query))
-    feed = await asyncio.to_thread(feedparser.parse, url)
-    titles = [e.title for e in (feed.entries or [])[:10]]
-    if not titles:
-        await update.message.reply_text("مفيش أخبار طازة عن الموضوع ده دلوقتي. جرب كلمة تانية.")
-        return
-    prompt = (
-        f"دي أحدث عناوين أخبار جوجل عن «{query}» في مصر دلوقتي:\n"
-        + "\n".join(f"- {t}" for t in titles)
-        + "\n\nلخص أهم النقاط بالعامية المصرية، وفي الآخر قولي: "
-        "إزاي ممكن أستغل ده في محتوى أو منتج لمتجري Mixora Buy، لو فيه فرصة."
-    )
-    try:
-        reply = await asyncio.to_thread(
-            ask_gemini,
-            f"news:{update.message.chat_id}",
-            prompt,
-            owner_prompt(),
-            2048,
-        )
-    except Exception:
-        logger.exception("Gemini call failed (/news)")
-        reply = FALLBACK
-    await update.message.reply_text(reply)
-
-
-async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner only: /news <keyword> -> Google News Egypt RSS -> Gemini summary with a store angle."""
-    if not _is_owner(update):
-        return
-    if not feedparser or not GEMINI_API_KEY:
-        await update.message.reply_text(FALLBACK)
-        return
-    query = " ".join(getattr(context, "args", None) or []).strip()
-    if not query:
-        await update.message.reply_text(
-            "ابعت /news وبعدها الموضوع، مثال: /news سماعات بلوتوث"
-        )
-        return
-    await _news_reply(update, query)
-
-
 # ---- Owner personal-assistant features (todos, notes, money, memory, briefing) ----
 
 def _fmt_entry(e: dict) -> str:
@@ -1378,7 +1331,6 @@ AR_SPENT_RE = re.compile(
 AR_EARN_RE = re.compile(
     r"^(?:/دخل\s+|سجل\s+دخل\s+|كسبت\s+|قبضت\s+|جالي\s+)"
     r"(\d+(?:\.\d+)?)\s*(?:جنيه|ج|جنية)?\s*(.*)$")
-AR_NEWS_RE = re.compile(r"^(?:هات|جيب|عايز|عاوز)?\s*(?:أخبار|اخبار)\s+(.+)$")
 
 
 async def handle_arabic_intent(update: Update, text: str) -> bool:
@@ -1396,17 +1348,6 @@ async def handle_arabic_intent(update: Update, text: str) -> bool:
         return True
     if AR_TRENDS_RE.match(t):
         await trends(update, None)
-        return True
-    m = AR_NEWS_RE.match(t)
-    if m:
-        if not feedparser or not GEMINI_API_KEY:
-            await update.message.reply_text(FALLBACK)
-            return True
-        try:
-            await _news_reply(update, m.group(1).strip())
-        except Exception:
-            logger.exception("News intent failed")
-            await update.message.reply_text(FALLBACK)
         return True
     if AR_BRIEFING_RE.match(t):
         await update.message.reply_text(build_briefing(update.message.chat_id))
@@ -1766,7 +1707,6 @@ async def run() -> None:
     telegram_app.add_handler(CommandHandler("store", store_ask))
     telegram_app.add_handler(CommandHandler("trends", trends))
     telegram_app.add_handler(CommandHandler("trend", trends))
-    telegram_app.add_handler(CommandHandler("news", news_cmd))
     telegram_app.add_handler(CommandHandler("reminders", reminders_list))
     telegram_app.add_handler(CommandHandler("todo", todo_cmd))
     telegram_app.add_handler(CommandHandler("note", note_cmd))
