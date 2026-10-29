@@ -1725,7 +1725,7 @@ def _submit_research_job(job_id: str, payload: dict):
         f"{BROWSER_WORKER_URL}/research-jobs/{job_id}",
         json=payload,
         headers=_worker_headers(),
-        timeout=30,
+        timeout=60,
     )
 
 
@@ -1770,6 +1770,7 @@ async def browse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("خدمة القراءة العميقة مش متاحة دلوقتي، جرب بعد شوية.")
         return
     if resp.status_code == 202:
+        asyncio.create_task(_browser_delivery_loop())
         await update.message.reply_text("بقرأ الصفحات دلوقتي، وهبعتلك الخلاصة الموثقة هنا أول ما تخلص 📖")
     else:
         logger.warning("browse submit rejected: %s %s", resp.status_code, resp.text[:200])
@@ -1780,7 +1781,7 @@ async def _browser_delivery_loop() -> None:
     # Delivers ready worker results. Claim is compare-and-swap on the worker, so
     # a result is never sent twice; an ack failure leaves the row for review
     # instead of auto-replaying.
-    while True:
+    for _ in range(24):
         try:
             pend = await asyncio.to_thread(
                 requests.get,
@@ -1814,7 +1815,7 @@ async def _browser_delivery_loop() -> None:
                 )
         except Exception:
             logger.exception("browser delivery loop tick failed")
-        await asyncio.sleep(20)
+        await asyncio.sleep(10)
 
 
 # ---- Web server: health endpoint + Telegram + WhatsApp webhooks ----
@@ -1890,8 +1891,7 @@ async def run() -> None:
         # Restore owner state (todos, notes, money, memory, reminders) from
         # the private Telegram backup channel if one is linked.
         await restore_from_backup()
-        if BROWSER_WORKER_TOKEN:
-            asyncio.create_task(_browser_delivery_loop())
+        # (browser results are delivered by a bounded poller started per /browse job)
         # Daily 9:00 Cairo briefing for every registered owner.
         for owner_id in OWNER_IDS:
             SCHEDULER.add_job(
