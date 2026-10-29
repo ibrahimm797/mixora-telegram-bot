@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -1676,6 +1677,146 @@ class WhatsAppWebhookHandler(RequestHandler):
         # Process in the background; Meta retries on timeouts, so ACK first.
         asyncio.get_event_loop().run_in_executor(None, handle_whatsapp_payload, data)
 
+
+# ---- Deep-read browser research via the separate public worker ----
+# Additive owner-only feature. The worker is a separate Render service with no
+# Telegram credentials; it reads 1-2 public pages in a real browser and returns
+# claims with verbatim quotes. This bot stays the only Telegram token consumer:
+# it polls the worker's durable outbox and delivers ready results itself.
+BROWSER_WORKER_URL = os.environ.get(
+    "BROWSER_WORKER_URL", "https://mixora-browser-acceptance.onrender.com"
+).rstrip("/")
+BROWSER_WORKER_TOKEN = os.environ.get("BROWSER_WORKER_TOKEN", "")
+
+
+def _worker_headers() -> dict:
+    return {"Authorization": "Bearer " + BROWSER_WORKER_TOKEN}
+
+
+def _browse_job_id(owner_id: int, update_id: int) -> str:
+    # Must match the worker's private-chat-only validation formula.
+    return "tg-" + hashlib.sha256(f"{owner_id}:{update_id}".encode()).hexdigest()[:32]
+
+
+def _pick_read_urls(results: list) -> list:
+    urls = []
+    for r in results:
+        href = (r.get("href") or "").strip()
+        if href.startswith("https://") and href not in urls:
+            urls.append(href)
+        if len(urls) == 2:
+            break
+    return urls
+
+
+def _format_research_message(result: dict) -> str:
+    if not result.get("verified"):
+        return "ماقدرتش أكمّل القراءة العميقة للصفحات دي. جرب سؤال أبسط أو صفحات تانية."
+    lines = ["📖 خلاصة القراءة العميقة (معلومات موثقة بنص منقول حرفيًا):"]
+    for claim in (result.get("claims") or [])[:6]:
+        lines.append(
+            "• " + claim["text"] + "\n\"" + claim["quote"] + "\"\n" + claim["source_url"]
+        )
+    return "\n\n".join(lines)[:4000]
+
+
+def _submit_research_job(job_id: str, payload: dict):
+    return requests.post(
+        f"{BROWSER_WORKER_URL}/research-jobs/{job_id}",
+        json=payload,
+        headers=_worker_headers(),
+        timeout=30,
+    )
+
+
+async def browse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    if not update.message:
+        return
+    question = " ".join(context.args).strip() if context.args else ""
+    if not question:
+        await update.message.reply_text(
+            "اكتب سؤالك بعد الأمر، مثال:\n/browse ايه أحدث أسعار ..."
+        )
+        return
+    if not BROWSER_WORKER_TOKEN:
+        await update.message.reply_text("خاصية القراءة العميقة لسه مش مفعّلة.")
+        return
+    results = await asyncio.to_thread(web_search, question, 5)
+    urls = _pick_read_urls(results)
+    if not urls:
+        await update.message.reply_text("مش لاقي صفحات عامة مناسبة للسؤال ده دلوقتي.")
+        return
+    instruction = (
+        "أجب على سؤال المستخدم بالعامية المصرية اعتمادًا على الصفحات المقروءة فقط، "
+        "مع اقتباس حرفي دقيق يثبت كل معلومة. السؤال: " + question
+    )[:1500]
+    payload = {
+        "instruction": instruction,
+        "scope": "public_page_research",
+        "account_access": False,
+        "start_urls": urls,
+        "delivery": True,
+        "owner_id": update.message.chat_id,
+        "chat_id": update.message.chat_id,
+        "update_id": update.update_id,
+    }
+    job_id = _browse_job_id(update.message.chat_id, update.update_id)
+    try:
+        resp = await asyncio.to_thread(_submit_research_job, job_id, payload)
+    except Exception:
+        logger.exception("browse submit failed")
+        await update.message.reply_text("خدمة القراءة العميقة مش متاحة دلوقتي، جرب بعد شوية.")
+        return
+    if resp.status_code == 202:
+        await update.message.reply_text("بقرأ الصفحات دلوقتي، وهبعتلك الخلاصة الموثقة هنا أول ما تخلص 📖")
+    else:
+        logger.warning("browse submit rejected: %s %s", resp.status_code, resp.text[:200])
+        await update.message.reply_text("مش قادر أبدأ القراءة دلوقتي (ضغط أو الحد اليومي). جرب بعد شوية.")
+
+
+async def _browser_delivery_loop() -> None:
+    # Delivers ready worker results. Claim is compare-and-swap on the worker, so
+    # a result is never sent twice; an ack failure leaves the row for review
+    # instead of auto-replaying.
+    while True:
+        try:
+            pend = await asyncio.to_thread(
+                requests.get,
+                f"{BROWSER_WORKER_URL}/delivery/pending",
+                headers=_worker_headers(),
+                timeout=20,
+            )
+            for job in pend.json().get("jobs", []):
+                if job.get("state") != "ready":
+                    continue
+                claim = await asyncio.to_thread(
+                    requests.post,
+                    f"{BROWSER_WORKER_URL}/delivery/{job['id']}/claim",
+                    headers=_worker_headers(),
+                    timeout=20,
+                )
+                if claim.status_code != 200:
+                    continue
+                data = claim.json()
+                msg = await telegram_app.bot.send_message(
+                    chat_id=data["chat_id"],
+                    text=_format_research_message(data.get("result") or {}),
+                    disable_web_page_preview=True,
+                )
+                await asyncio.to_thread(
+                    requests.post,
+                    f"{BROWSER_WORKER_URL}/delivery/{job['id']}/ack",
+                    json={"message_id": msg.message_id},
+                    headers=_worker_headers(),
+                    timeout=20,
+                )
+        except Exception:
+            logger.exception("browser delivery loop tick failed")
+        await asyncio.sleep(20)
+
+
 # ---- Web server: health endpoint + Telegram + WhatsApp webhooks ----
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
@@ -1720,6 +1861,7 @@ async def run() -> None:
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     telegram_app.add_handler(CommandHandler("backupstatus", backupstatus_cmd))
+    telegram_app.add_handler(CommandHandler("browse", browse_cmd))
     telegram_app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     if BASE_URL:
@@ -1748,6 +1890,8 @@ async def run() -> None:
         # Restore owner state (todos, notes, money, memory, reminders) from
         # the private Telegram backup channel if one is linked.
         await restore_from_backup()
+        if BROWSER_WORKER_TOKEN:
+            asyncio.create_task(_browser_delivery_loop())
         # Daily 9:00 Cairo briefing for every registered owner.
         for owner_id in OWNER_IDS:
             SCHEDULER.add_job(
