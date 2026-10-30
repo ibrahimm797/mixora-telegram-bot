@@ -39,7 +39,8 @@ _CMDS = {"browse": "browse", "page": "page", "links": "links", "images": "images
          "price": "price", "text": "text", "back": "back", "closebrowser": "close", "click": "click"}
 MAX_TEXT = 3500
 WAIT_ROUNDS = 3          # each round waits up to ~100s server side; same id is resent
-CONNECT_TIMEOUT = 25
+CONNECT_TIMEOUT = 60      # a sleeping free instance can take ~45-60s to accept
+BACKOFF = (5, 10, 20)     # pause after a network error or 5xx, same id
 READ_TIMEOUT = 120
 
 
@@ -115,6 +116,10 @@ def format_result(cmd, result):
     return out[:MAX_TEXT]
 
 
+async def _pause(i):
+    await asyncio.sleep(BACKOFF[min(i, len(BACKOFF) - 1)])
+
+
 async def run_command(cmd, args, payload=None):
     """Returns user-facing text. Never raises. A given payload is resent with its
     original id (the server never runs an id twice)."""
@@ -128,13 +133,18 @@ async def run_command(cmd, args, payload=None):
     _pending = payload
     _save_pending(payload)   # unresolved until a terminal outcome is seen
     loop = asyncio.get_event_loop()
-    for _ in range(WAIT_ROUNDS):
+    errors = 0
+    rounds = 0
+    while rounds < WAIT_ROUNDS and errors <= len(BACKOFF):
         try:
             code, body = await loop.run_in_executor(None, _post, url, token, payload)
         except Exception as exc:
             logger.warning("remote browser request failed: %s", type(exc).__name__)
+            await _pause(errors)
+            errors += 1
             continue  # same id: the server never re-executes, it returns the stored row
         if code == 202:
+            rounds += 1
             continue
         if code == 200 and body.get("status") in ("done", "failed", "error", "cancelled"):
             _pending = None
@@ -152,7 +162,9 @@ async def run_command(cmd, args, payload=None):
             return "مرفوض: " + err + extra
         if code in (401, 404, 405):
             return "ربط المتصفح غير مفعّل أو الرمز غير صحيح."
-        continue  # 5xx or unexpected body: outcome unknown, keep the same id pending
+        logger.warning("remote browser service answered HTTP %s", code)
+        await _pause(errors)
+        errors += 1  # 5xx or unexpected body: outcome unknown, keep the same id pending
     return ("نتيجة الأمر غير معروفة لحد دلوقتي (ممكن يكون اتنفّذ أو لسه شغال). "
             "رقم المهمة: %s. اكتب /result أجيب النتيجة من غير ما أعيد التنفيذ. "
             "لو فضلت غير معروفة لازم تتراجع يدويًا قبل أي أمر جديد."
