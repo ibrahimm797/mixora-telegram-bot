@@ -1702,6 +1702,11 @@ class WebhookHandler(RequestHandler):
 
 
 async def run() -> None:
+    try:
+        import remote_browser  # owner-only browser link; inert unless env is set
+        remote_browser.register(telegram_app, _is_owner)
+    except Exception:
+        logger.exception("remote browser link not registered; bot continues without it")
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("whoami", whoami))
     telegram_app.add_handler(CommandHandler("store", store_ask))
