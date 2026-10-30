@@ -1,6 +1,8 @@
 """Owner-only Telegram commands for READING public web pages through a separate
 browser service. Scope (do not read more into it):
-- public pages only; no logins, no buttons, no typing, no purchases;
+- public pages only, and only sites on the browser service's explicit
+  allowed-sites list (anything else is refused there); no logins, no buttons,
+  no typing, no purchases;
 - one command at a time, the first one after idle can take up to ~2 minutes;
 - Amazon (including Associates and short links) is refused by the browser
   service at every navigation hop, and a site that redirects to a different
@@ -13,6 +15,9 @@ Each command is forwarded to POST {REMOTE_BROWSER_URL}/tasks-exec with the
 shared bearer token. The work runs in a background task, so the bot's update
 loop is never held while the browser works. If the outcome is not known, the
 SAME task id is kept and /result fetches it without running the command again.
+The unresolved id is kept in a local file only; it does not survive a redeploy.
+A message redelivered by Telegram reuses its id, but a fresh retry typed by the
+user after a redeploy gets a new id and can run the (read-only) command again.
 """
 import asyncio
 import json
@@ -149,7 +154,8 @@ async def run_command(cmd, args, payload=None):
             return "ربط المتصفح غير مفعّل أو الرمز غير صحيح."
         continue  # 5xx or unexpected body: outcome unknown, keep the same id pending
     return ("نتيجة الأمر غير معروفة لحد دلوقتي (ممكن يكون اتنفّذ أو لسه شغال). "
-            "رقم المهمة: %s. اكتب /result أجيب النتيجة من غير ما أعيد التنفيذ."
+            "رقم المهمة: %s. اكتب /result أجيب النتيجة من غير ما أعيد التنفيذ. "
+            "لو فضلت غير معروفة لازم تتراجع يدويًا قبل أي أمر جديد."
             % payload["id"][:8])
 
 
@@ -176,12 +182,6 @@ def _spawn(message, cmd, args, payload=None):
     task.add_done_callback(_tasks.discard)
 
 
-def _pending_clear():
-    global _pending
-    _pending = None
-    _save_pending(None)
-
-
 def _make_handler(name, is_owner):
     async def handler(update, context):
         if not is_owner(update) or update.effective_message is None:
@@ -191,10 +191,6 @@ def _make_handler(name, is_owner):
         if name == "result":
             if _pending is None:
                 await msg.reply_text("مفيش مهمة معلّقة.")
-                return
-            if context.args and context.args[0] == "drop":
-                _pending_clear()
-                await msg.reply_text("اتنسّت المهمة المعلّقة محليًا (ممكن تكون اتنفّذت).")
                 return
             if _busy:
                 await msg.reply_text("في مهمة شغالة دلوقتي، استنى لما تخلص.")
