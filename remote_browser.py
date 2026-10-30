@@ -1,12 +1,18 @@
-"""Owner-only Telegram commands that drive the separate browser service.
+"""Owner-only Telegram commands for READING public web pages through a separate
+browser service. Scope (do not read more into it):
+- public pages only; no logins, no buttons, no typing, no purchases;
+- one command at a time, the first one after idle can take up to ~2 minutes;
+- Amazon (including Associates and short links) is refused by the browser
+  service at every navigation hop, and a site that redirects to a different
+  site is not followed.
 
 Inert unless both REMOTE_BROWSER_URL (https) and REMOTE_BROWSER_TOKEN are set:
 register() then adds nothing and the bot behaves exactly as before.
 
 Each command is forwarded to POST {REMOTE_BROWSER_URL}/tasks-exec with the
-shared bearer token. The browser service decides what is allowed (public
-sites only; Amazon is refused there at every navigation hop). Buttons and
-typing are not supported here.
+shared bearer token. The work runs in a background task, so the bot's update
+loop is never held while the browser works. If the outcome is not known, the
+SAME task id is kept and /result fetches it without running the command again.
 """
 import asyncio
 import logging
@@ -18,13 +24,15 @@ from telegram.ext import CommandHandler
 
 logger = logging.getLogger("remote_browser")
 
-_lock = asyncio.Lock()
+_busy = False            # one command at a time; set synchronously before the job starts
+_pending = None          # payload (with its id) whose outcome is still unknown
+_tasks = set()           # strong refs to background jobs
 _CMDS = {"browse": "browse", "page": "page", "links": "links", "images": "images",
          "price": "price", "text": "text", "back": "back", "closebrowser": "close", "click": "click"}
 MAX_TEXT = 3500
 WAIT_ROUNDS = 3          # each round waits up to ~100s server side; same id is resent
 CONNECT_TIMEOUT = 25
-READ_TIMEOUT = 135
+READ_TIMEOUT = 120
 
 
 def _config():
@@ -75,25 +83,29 @@ def format_result(cmd, result):
     return out[:MAX_TEXT]
 
 
-async def run_command(cmd, args):
-    """Returns user-facing text. Never raises."""
+async def run_command(cmd, args, payload=None):
+    """Returns user-facing text. Never raises. A given payload is resent with its
+    original id (the server never runs an id twice)."""
+    global _pending
     cfg = _config()
     if cfg is None:
         return "ربط المتصفح غير مفعّل."
     url, token = cfg
-    payload = {"id": uuid.uuid4().hex, "cmd": cmd, "args": args}
+    if payload is None:
+        payload = {"id": uuid.uuid4().hex, "cmd": cmd, "args": args}
     loop = asyncio.get_event_loop()
     for _ in range(WAIT_ROUNDS):
         try:
             code, body = await loop.run_in_executor(None, _post, url, token, payload)
         except Exception as exc:
             logger.warning("remote browser request failed: %s", type(exc).__name__)
-            continue  # same id: server never re-executes, it returns the stored row
+            continue  # same id: the server never re-executes, it returns the stored row
         if code == 202:
             continue
+        _pending = None
         if code == 200:
             if body.get("status") == "done":
-                return format_result(cmd, body.get("result"))
+                return format_result(payload["cmd"], body.get("result"))
             err = str(body.get("error") or body.get("status"))[:600]
             return "تعذر التنفيذ: " + err
         if code == 400:
@@ -103,30 +115,67 @@ async def run_command(cmd, args):
         if code in (401, 404, 405):
             return "ربط المتصفح غير مفعّل أو الرمز غير صحيح."
         return "الخدمة ردّت بخطأ (%s)." % code
-    return "المتصفح لم يرد في الوقت المحدد. لم يُعاد التنفيذ تلقائيًا؛ جرّب الأمر مرة أخرى بعد قليل."
+    _pending = payload
+    return ("نتيجة الأمر غير معروفة لحد دلوقتي (ممكن يكون اتنفّذ أو لسه شغال). "
+            "رقم المهمة: %s. اكتب /result أجيب النتيجة من غير ما أعيد التنفيذ."
+            % payload["id"][:8])
 
 
-def _make_handler(cmd, is_owner):
+async def _job(message, cmd, args, payload=None):
+    global _busy
+    try:
+        text = await run_command(cmd, args, payload)
+    finally:
+        _busy = False
+    try:
+        await message.reply_text(text)
+    except Exception as exc:
+        logger.warning("could not send browser result: %s", type(exc).__name__)
+
+
+def _spawn(message, cmd, args, payload=None):
+    global _busy
+    _busy = True
+    task = asyncio.create_task(_job(message, cmd, args, payload))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def _make_handler(name, is_owner):
     async def handler(update, context):
         if not is_owner(update) or update.effective_message is None:
             return
+        msg = update.effective_message
         args = {}
-        if cmd == "browse":
+        if name == "result":
+            if _pending is None:
+                await msg.reply_text("مفيش مهمة معلّقة.")
+                return
+            if _busy:
+                await msg.reply_text("في مهمة شغالة دلوقتي، استنى لما تخلص.")
+                return
+            await msg.reply_text("بجيب نتيجة نفس المهمة (من غير إعادة تنفيذ)...")
+            _spawn(msg, _pending["cmd"], _pending["args"], _pending)
+            return
+        if name == "browse":
             if not context.args:
-                await update.effective_message.reply_text("استخدم: /browse رابط")
+                await msg.reply_text("استخدم: /browse رابط")
                 return
             args = {"url": context.args[0]}
-        elif cmd == "click":
+        elif name == "click":
             if not context.args or not context.args[0].isdigit():
-                await update.effective_message.reply_text("استخدم: /click رقم (من /links)")
+                await msg.reply_text("استخدم: /click رقم (من /links)")
                 return
             args = {"index": int(context.args[0])}
-        async with _lock:
-            await update.effective_message.reply_text("جارٍ التنفيذ... (أول مرة قد تأخذ حتى دقيقتين)")
-            text = await run_command(_CMDS[cmd], args)
-        await update.effective_message.reply_text(text)
+        if _pending is not None:
+            await msg.reply_text("في مهمة سابقة نتيجتها لسه غير معروفة. اكتب /result الأول.")
+            return
+        if _busy:
+            await msg.reply_text("في أمر شغال دلوقتي، استنى لما يخلص.")
+            return
+        await msg.reply_text("جارٍ التنفيذ... (أول مرة بعد فترة قد تأخذ حتى دقيقتين)")
+        _spawn(msg, _CMDS[name], args)
     return handler
-
 
 
 def register(telegram_app, is_owner):
@@ -134,7 +183,7 @@ def register(telegram_app, is_owner):
     if _config() is None:
         logger.info("remote browser link not configured; commands not registered")
         return False
-    for name, cmd in _CMDS.items():
+    for name in list(_CMDS) + ["result"]:
         telegram_app.add_handler(CommandHandler(name, _make_handler(name, is_owner)))
     logger.info("remote browser commands registered (owner-only)")
     return True
