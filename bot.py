@@ -89,19 +89,39 @@ WELCOME = (
     "أهلا بيك في Mixora Buy! "
     "قولي إنت بتدور على إيه (مثلا: ساعة، سماعة، كاميرا مراقبة) وأنا أرشحلك من منتجاتنا."
 )
-OWNER_WELCOME = (
-    "أهلا يا إبراهيم! أنا مساعدك الشخصي هنا. اسألني في أي حاجة: شرح أو ترجمة إنجليزي، "
-    "كتابة رسايل وبوستات للمتجر، بحث وتلخيص من الإنترنت، حسابات وتخطيط، أو أسئلة عامة.\n"
-    "- تذكير: قول فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد) و /reminders لعرضهم\n"
-    "- تريندات مصر: ابعت /trends\n"
-    "- ملخص يومك: /briefing (وبيوصلك لوحده كل يوم 9 الصبح)\n"
-    "- مهام وملاحظات وفلوس: /todo و /note و /spent و /earned و /money\n"
-    "- ذاكرة: قول افتكر... أو /remember عشان أفكر تفضيلاتك\n"
-    "- ابعتلي لينك ألخصه، أو فويس نوت أسمعه وأرد عليك\n"
-    "- ردود صوتية: ابعت /voice، أو ابدأ رسالتك بكلمة صوت\n"
-    "- صورة بنص عربي: ابعت أي صورة منتج واكتب النص في الكابشن\n"
-    "- تجربة ردود العملاء: ابعت /store وبعدين سؤالك"
-)
+def _remote_browser_on() -> bool:
+    return bool(
+        os.environ.get("REMOTE_BROWSER_URL", "").startswith("https://")
+        and os.environ.get("REMOTE_BROWSER_TOKEN")
+    )
+
+
+def owner_welcome() -> str:
+    """Owner command list. Every command works in plain Arabic, no slash needed."""
+    lines = [
+        "أهلا يا إبراهيم! أنا مساعدك الشخصي هنا. اسألني في أي حاجة: شرح أو ترجمة إنجليزي، "
+        "كتابة رسايل وبوستات للمتجر، بحث وتلخيص من الإنترنت، حسابات وتخطيط، أو أسئلة عامة.",
+        "كل الأوامر بالعربي ومن غير شرطة:",
+        "- تذكير: قول فكرني... (مثال: فكرني بكرة الساعة 5 أكلم المورد)، و تذكيراتي لعرضهم",
+        "- ترندات مصر: ابعت ترند",
+        "- ملخص يومك: ملخص (وبيوصلك لوحده كل يوم 9 الصبح)",
+        "- مهامك: ضيف مهمة وبعدين المهمة - مهامي للعرض - خلصت ورقمها لما تخلص",
+        "- ملاحظات: سجل ملاحظة وبعدين الكلام - ملاحظاتي للعرض",
+        "- فلوس: صرفت 50 مواصلات - كسبت 200 - فلوسي للملخص",
+        "- ذاكرة: قول افتكر... عشان أفكر تفضيلاتك",
+        "- ابعتلي لينك ألخصه، أو فويس نوت أسمعه وأرد عليك",
+        "- ردود صوتية: ابعت صوت للتشغيل أو القفل، أو ابدأ رسالتك بكلمة صوت",
+        "- صورة بنص عربي: ابعت أي صورة منتج واكتب النص في الكابشن",
+        "- تجربة ردود العملاء: اسأل المتجر وبعدين سؤالك",
+        "- حالة النسخ الاحتياطي: حالة النسخ",
+    ]
+    if _remote_browser_on():
+        lines.append(
+            "- المتصفح (قراءة صفحات بس): تصفح وبعدين الرابط، وبعدها اللينكات أو الصور أو "
+            "السعر أو النص أو ارجع أو اقفل المتصفح، ولو النتيجة طلعت غير معروفة ابعت النتيجة"
+        )
+    lines.append("- عرض الأوامر دي تاني: الأوامر")
+    return "\n".join(lines)
 FALLBACK = "وصلتني رسالتك، بس في مشكلة فنية دلوقتي. جرب تاني بعد شوية."
 # Gemini returns this exact sentinel when a message is not store-related;
 # the webhook then stays silent (user rule: work messages only).
@@ -917,10 +937,10 @@ async def todo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         open_todos = [t for t in todos if not t.get("done")]
         if not open_todos:
-            await update.message.reply_text("مفيش مهام مسجلة. ابعت /todo وبعدين المهمة عشان تضيفها.")
+            await update.message.reply_text("مفيش مهام مسجلة. قول: ضيف مهمة وبعدين المهمة عشان تضيفها.")
             return
         lines = [f"{i+1}. {t['text']}" for i, t in enumerate(open_todos)]
-        await update.message.reply_text("مهامك:\n" + "\n".join(lines) + "\n\nلما تخلص واحدة ابعت: /todo done ورقمها")
+        await update.message.reply_text("مهامك:\n" + "\n".join(lines) + "\n\nلما تخلص واحدة قول: خلصت ورقمها")
         return
     text = " ".join(args).strip()
     todos.append({"text": text, "done": False,
@@ -938,7 +958,7 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args:
         if not notes:
-            await update.message.reply_text("مفيش ملاحظات. ابعت /note وبعدين الكلام عشان تحفظه.")
+            await update.message.reply_text("مفيش ملاحظات. قول: سجل ملاحظة وبعدين الكلام عشان تحفظها.")
             return
         lines = [f"- {_fmt_entry(n)}" for n in notes[-15:]]
         await update.message.reply_text("ملاحظاتك:\n" + "\n".join(lines))
@@ -974,7 +994,9 @@ async def money_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     if len(args) < 1 or not args[0].replace(".", "", 1).isdigit():
-        await update.message.reply_text(f"اكتبها كده: /{cmd} المبلغ الوصف - مثال: /{cmd} 50 مواصلات")
+        ar_verb = "صرفت" if cmd == "spent" else "كسبت"
+        await update.message.reply_text(
+            f"اكتبها كده: {ar_verb} 50 مواصلات (أو /{cmd} 50 مواصلات)")
         return
     amount = float(args[0])
     text = " ".join(args[1:]).strip()
@@ -994,7 +1016,7 @@ async def remember_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     text = " ".join(context.args or []).strip()
     if not text:
-        await update.message.reply_text("اكتب اللي عايزني أفتكره بعد الأمر. مثال: /remember بحب الردود المختصرة")
+        await update.message.reply_text("قول: افتكر وبعدين الحاجة. مثال: افتكر بحب الردود المختصرة")
         return
     data = _load_data()
     mem = data.setdefault("memory", [])
@@ -1027,7 +1049,7 @@ def build_briefing(chat_id: int) -> str:
     else:
         lines.append("- مفيش تذكيرات النهاردة.")
     lines.append(f"- الصافي المسجل: {earned-spent:g} جنيه")
-    lines.append("ابعت /trends لو عايز ترندات النهاردة.")
+    lines.append("ابعت: ترند لو عايز ترندات النهاردة.")
     return "\n".join(lines)
 
 
@@ -1142,7 +1164,7 @@ async def voice_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         VOICE_ON.add(chat_id)
         await update.message.reply_text(
-            "تمام، هرد عليك صوت وكتابة. ابعت /voice تاني لو عايز تقفلها."
+            "تمام، هرد عليك صوت وكتابة. ابعت صوت تاني لو عايز تقفلها."
         )
 
 
@@ -1263,7 +1285,14 @@ def _is_owner(update: Update) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        OWNER_WELCOME if _is_owner(update) else WELCOME
+        owner_welcome() if _is_owner(update) else WELCOME
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Arabic-first command list (same as /start)."""
+    await update.message.reply_text(
+        owner_welcome() if _is_owner(update) else WELCOME
     )
 
 
@@ -1274,12 +1303,10 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"الـ Telegram ID بتاعك هو: {user.id}")
 
 
-async def store_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Let the owner (or anyone) ask the store persona directly: /store <question>"""
-    question = " ".join(context.args or []).strip()
+async def _store_answer(update: Update, question: str) -> None:
     if not question:
         await update.message.reply_text(
-            "اكتب سؤالك بعد الأمر، مثال: /store عايز سماعة بلوتوث"
+            "اكتب سؤالك بعد الأمر، مثال: اسأل المتجر عايز سماعة بلوتوث"
         )
         return
     if not GEMINI_API_KEY:
@@ -1290,11 +1317,16 @@ async def store_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ask_gemini, f"store:{update.message.chat_id}", question
         )
     except Exception:
-        logger.exception("Gemini call failed (/store)")
+        logger.exception("Gemini call failed (store question)")
         reply = FALLBACK
     if reply.strip() == IGNORE_TOKEN:
         reply = "السؤال ده مش ليه علاقة بمنتجات المتجر."
     await update.message.reply_text(reply)
+
+
+async def store_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Let the owner (or anyone) ask the store persona directly: /store <question>"""
+    await _store_answer(update, " ".join(context.args or []).strip())
 
 
 # ---- Egyptian-Arabic natural-language intents (owner; no slash needed) ----
@@ -1332,12 +1364,51 @@ AR_EARN_RE = re.compile(
     r"^(?:/دخل\s+|سجل\s+دخل\s+|كسبت\s+|قبضت\s+|جالي\s+)"
     r"(\d+(?:\.\d+)?)\s*(?:جنيه|ج|جنية)?\s*(.*)$")
 
+AR_COMMANDS_RE = re.compile(
+    r"^(الأوامر|الاوامر|اوامر|مساعدة|المساعدة|قولي الأوامر|قولي الاوامر)\s*$")
+AR_WHOAMI_RE = re.compile(
+    r"^(مين انا|مين أنا|الاي دي بتاعي|الآي دي بتاعي|الايدي بتاعي|ايدي بتاعي|"
+    r"ايدي تيليجرام)\s*[؟?]*\s*$")
+AR_BACKUP_RE = re.compile(
+    r"^(حالة النسخ|النسخ الاحتياطي|النسخة الاحتياطية|حالة النسخة الاحتياطية)\s*$")
+AR_VOICE_RE = re.compile(
+    r"^(صوت|شغل الصوت|شغلي الصوت|اقفل الصوت|اقفلي الصوت|الردود الصوتية)\s*$")
+AR_STORE_ASK_RE = re.compile(
+    r"^(?:اسأل المتجر|اسال المتجر|/متجر)\s*[:،]?\s*(.+)$")
+
+
+_RB_MODULE = "unset"
+
+
+def _remote_browser_module():
+    """The owner browser-link module, only when importable and configured."""
+    global _RB_MODULE
+    if _RB_MODULE == "unset":
+        try:
+            import remote_browser
+            _RB_MODULE = remote_browser
+        except Exception:
+            logger.exception("remote browser module unavailable")
+            _RB_MODULE = None
+    if _RB_MODULE is not None and not _RB_MODULE.configured():
+        return None
+    return _RB_MODULE
+
 
 async def handle_arabic_intent(update: Update, text: str) -> bool:
     """Run owner commands phrased in plain Egyptian Arabic. True if handled."""
     t = text.strip().translate(_AR_DIGITS)
     if not t:
         return False
+    rb = _remote_browser_module()
+    if rb is not None:
+        try:
+            if await rb.handle_arabic(update, t):
+                return True
+        except Exception:
+            logger.exception("Arabic browser command failed")
+            await update.message.reply_text(FALLBACK)
+            return True
     data = _load_data()
     m = re.match(r"^(افتكر|متنساش)\s*(اني|إني|ان|إن)?\s*(.+)$", t)
     if m and m.group(3).strip():
@@ -1459,6 +1530,22 @@ async def handle_arabic_intent(update: Update, text: str) -> bool:
         await update.message.reply_text(
             f"سجلت الدخل: {amount:g} جنيه {desc}\nالصافي دلوقتي: {earned-spent:g} جنيه"
         )
+        return True
+    if AR_COMMANDS_RE.match(t):
+        await update.message.reply_text(owner_welcome())
+        return True
+    if AR_WHOAMI_RE.match(t):
+        await whoami(update, None)
+        return True
+    if AR_BACKUP_RE.match(t):
+        await backupstatus_cmd(update, None)
+        return True
+    if AR_VOICE_RE.match(t):
+        await voice_toggle(update, None)
+        return True
+    m = AR_STORE_ASK_RE.match(t)
+    if m:
+        await _store_answer(update, m.group(1).strip())
         return True
     return False
 
@@ -1708,6 +1795,7 @@ async def run() -> None:
     except Exception:
         logger.exception("remote browser link not registered; bot continues without it")
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("whoami", whoami))
     telegram_app.add_handler(CommandHandler("store", store_ask))
     telegram_app.add_handler(CommandHandler("trends", trends))
