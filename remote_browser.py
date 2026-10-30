@@ -15,6 +15,7 @@ loop is never held while the browser works. If the outcome is not known, the
 SAME task id is kept and /result fetches it without running the command again.
 """
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -27,12 +28,38 @@ logger = logging.getLogger("remote_browser")
 _busy = False            # one command at a time; set synchronously before the job starts
 _pending = None          # payload (with its id) whose outcome is still unknown
 _tasks = set()           # strong refs to background jobs
+_STATE = os.environ.get("REMOTE_BROWSER_STATE", "/tmp/remote_browser_pending.json")
+_NS = uuid.UUID("6f1c2d5e-0b7a-4c1e-9d3a-52a1f0c7b9e4")
 _CMDS = {"browse": "browse", "page": "page", "links": "links", "images": "images",
          "price": "price", "text": "text", "back": "back", "closebrowser": "close", "click": "click"}
 MAX_TEXT = 3500
 WAIT_ROUNDS = 3          # each round waits up to ~100s server side; same id is resent
 CONNECT_TIMEOUT = 25
 READ_TIMEOUT = 120
+
+
+def _save_pending(p):
+    """Write-ahead record of the unresolved job (survives a process restart)."""
+    try:
+        if p is None:
+            if os.path.exists(_STATE):
+                os.remove(_STATE)
+        else:
+            with open(_STATE, "w") as f:
+                json.dump(p, f)
+    except OSError as exc:
+        logger.warning("could not persist browser job state: %s", type(exc).__name__)
+
+
+def _load_pending():
+    global _pending
+    try:
+        with open(_STATE) as f:
+            p = json.load(f)
+        if isinstance(p, dict) and p.get("id") and p.get("cmd"):
+            _pending = p
+    except (OSError, ValueError):
+        pass
 
 
 def _config():
@@ -93,6 +120,8 @@ async def run_command(cmd, args, payload=None):
     url, token = cfg
     if payload is None:
         payload = {"id": uuid.uuid4().hex, "cmd": cmd, "args": args}
+    _pending = payload
+    _save_pending(payload)   # unresolved until a terminal outcome is seen
     loop = asyncio.get_event_loop()
     for _ in range(WAIT_ROUNDS):
         try:
@@ -102,20 +131,23 @@ async def run_command(cmd, args, payload=None):
             continue  # same id: the server never re-executes, it returns the stored row
         if code == 202:
             continue
-        _pending = None
-        if code == 200:
+        if code == 200 and body.get("status") in ("done", "failed", "error", "cancelled"):
+            _pending = None
+            _save_pending(None)
             if body.get("status") == "done":
                 return format_result(payload["cmd"], body.get("result"))
             err = str(body.get("error") or body.get("status"))[:600]
             return "تعذر التنفيذ: " + err
+        if code in (400, 401, 404, 405):   # rejected before anything was queued
+            _pending = None
+            _save_pending(None)
         if code == 400:
             err = str(body.get("error") or "")[:300]
             extra = "\nأمازون غير متاح عبر هذا الربط." if "Amazon" in err else ""
             return "مرفوض: " + err + extra
         if code in (401, 404, 405):
             return "ربط المتصفح غير مفعّل أو الرمز غير صحيح."
-        return "الخدمة ردّت بخطأ (%s)." % code
-    _pending = payload
+        continue  # 5xx or unexpected body: outcome unknown, keep the same id pending
     return ("نتيجة الأمر غير معروفة لحد دلوقتي (ممكن يكون اتنفّذ أو لسه شغال). "
             "رقم المهمة: %s. اكتب /result أجيب النتيجة من غير ما أعيد التنفيذ."
             % payload["id"][:8])
@@ -125,6 +157,9 @@ async def _job(message, cmd, args, payload=None):
     global _busy
     try:
         text = await run_command(cmd, args, payload)
+    except Exception as exc:   # never leave the busy flag set
+        logger.warning("browser job crashed: %s", type(exc).__name__)
+        text = "حصل خطأ داخلي. اكتب /result أجيب حالة المهمة لو كانت اتبعتت."
     finally:
         _busy = False
     try:
@@ -141,6 +176,12 @@ def _spawn(message, cmd, args, payload=None):
     task.add_done_callback(_tasks.discard)
 
 
+def _pending_clear():
+    global _pending
+    _pending = None
+    _save_pending(None)
+
+
 def _make_handler(name, is_owner):
     async def handler(update, context):
         if not is_owner(update) or update.effective_message is None:
@@ -150,6 +191,10 @@ def _make_handler(name, is_owner):
         if name == "result":
             if _pending is None:
                 await msg.reply_text("مفيش مهمة معلّقة.")
+                return
+            if context.args and context.args[0] == "drop":
+                _pending_clear()
+                await msg.reply_text("اتنسّت المهمة المعلّقة محليًا (ممكن تكون اتنفّذت).")
                 return
             if _busy:
                 await msg.reply_text("في مهمة شغالة دلوقتي، استنى لما تخلص.")
@@ -174,7 +219,10 @@ def _make_handler(name, is_owner):
             await msg.reply_text("في أمر شغال دلوقتي، استنى لما يخلص.")
             return
         await msg.reply_text("جارٍ التنفيذ... (أول مرة بعد فترة قد تأخذ حتى دقيقتين)")
-        _spawn(msg, _CMDS[name], args)
+        # id derived from the Telegram update: a redelivered update maps to the same id
+        pl = {"id": uuid.uuid5(_NS, "tg-update-%s" % update.update_id).hex,
+              "cmd": _CMDS[name], "args": args}
+        _spawn(msg, pl["cmd"], args, pl)
     return handler
 
 
@@ -183,7 +231,18 @@ def register(telegram_app, is_owner):
     if _config() is None:
         logger.info("remote browser link not configured; commands not registered")
         return False
-    for name in list(_CMDS) + ["result"]:
+    names = list(_CMDS) + ["result"]
+    taken = set()
+    for hs in telegram_app.handlers.values():
+        for h in hs:
+            if isinstance(h, CommandHandler):
+                taken |= set(h.commands)
+    clash = [n for n in names if n in taken]
+    if clash:
+        logger.error("remote browser not registered, command name clash: %s", clash)
+        return False
+    _load_pending()
+    for name in names:
         telegram_app.add_handler(CommandHandler(name, _make_handler(name, is_owner)))
     logger.info("remote browser commands registered (owner-only)")
     return True
