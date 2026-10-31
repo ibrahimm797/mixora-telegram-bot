@@ -1788,7 +1788,16 @@ class WebhookHandler(RequestHandler):
         self.finish()
 
 
+from amazon_search import product_search as amazon_product_search
+
 async def run() -> None:
+    telegram_app.add_handler(CommandHandler(
+        "product",
+        lambda update, context: amazon_product_search(
+            update, context, _is_owner
+        )
+    ))
+
     try:
         import remote_browser  # owner-only browser link; inert unless env is set
         remote_browser.register(telegram_app, _is_owner)
